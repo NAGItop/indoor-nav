@@ -510,9 +510,11 @@ function generateSteps(segments, startRoom, endRoom) {
                 : getNearbyHint(startPos[0], startPos[1], seg.floor);
 
             if (turn !== "直行") {
+                // 转向合并到直行后面：先直行到转向点，再转向
+                const turnText = isLast ? `${turn}` : `${turn}`;
                 state.pathSteps.push({
                     icon: turn === "右转" ? "↪️" : turn === "左转" ? "↩️" : "🔄",
-                    instruction: `${turn}，直行 ${dist} 米`,
+                    instruction: `直行 ${dist} 米，${isLast ? '然后' : '然后'}${turnText}`,
                     hint: hint,
                     floor: seg.floor,
                     pathPos: startPos,
