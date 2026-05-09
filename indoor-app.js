@@ -472,53 +472,50 @@ function generateSteps(segments, startRoom, endRoom) {
         const path = seg.path;
         const isLastSeg = si === segments.length - 1;
 
-        // 分析路径：先收集每段方向+距离，再统一生成步骤
-        let lastDir  = null;
-        let runDist  = 0;
-        // segs 数组：每项 { dir, dist }（dist = 格数）
-        const segs = [];
+        // 分析路径：收集连续相同方向的段，每段 = {dir, count, startIdx}
+        // count = 该方向的边数（不是格数）
+        const dirSegs = [];
+        let segStart = 0;
+        let segDir   = null;
 
-        for (let i = 1; i < path.length; i++) {
-            const [r1,c1] = path[i-1];
-            const [r2,c2] = path[i];
-            const dir = getDir(r1,c1,r2,c2);
-
-            if (dir === lastDir) {
-                runDist++;
-            } else {
-                if (lastDir !== null) {
-                    segs.push({ dir: lastDir, dist: runDist });
+        for (let i = 1; i <= path.length; i++) {
+            const dir = (i < path.length)
+                ? getDir(path[i-1][0], path[i-1][1], path[i][0], path[i][1])
+                : null;
+            if (dir !== segDir) {
+                if (segDir !== null) {
+                    dirSegs.push({
+                        dir: segDir,
+                        count: i - segStart,   // 边数 = 终点索引 - 起点索引
+                        startIdx: segStart
+                    });
                 }
-                runDist = 0;
-                lastDir = dir;
+                segDir   = dir;
+                segStart = i;
             }
-        }
-        if (lastDir !== null) {
-            segs.push({ dir: lastDir, dist: runDist });
         }
 
         // 根据段落生成步骤（转向合并到下一步直行）
-        let stepFacing = facing; // 复制一份，不污染外层
-        for (let si2 = 0; si2 < segs.length; si2++) {
-            const s = segs[si2];
-            const turn = si2 === 0 ? "直行" : getRelativeTurn(stepFacing, s.dir);
+        for (let dsi = 0; dsi < dirSegs.length; dsi++) {
+            const s = dirSegs[dsi];
+            const turn = dsi === 0 ? "直行" : getRelativeTurn(facing, s.dir);
             if (turn !== "直行") {
-                stepFacing = updateFacing(stepFacing, turn);
+                facing = updateFacing(facing, turn);
             }
-            const dist = (s.dist * 0.5).toFixed(1);
-            const isLastSegStep = (si2 === segs.length - 1);
-            const hint = isLastSegStep ? (isLastSeg ? "即将到达目的地" : "前方即是楼梯间") : getNearbyHint(
-                si2 < segs.length ? path[1][0] : path[path.length-1][0],
-                si2 < segs.length ? path[1][1] : path[path.length-1][1],
-                seg.floor
-            );
+            const dist     = (s.count * 0.5).toFixed(1);
+            const isLast   = (dsi === dirSegs.length - 1);
+            const startPos = path[s.startIdx];
+            const hint     = isLast
+                ? (isLastSeg ? "即将到达目的地" : "前方即是楼梯间")
+                : getNearbyHint(startPos[0], startPos[1], seg.floor);
+
             if (turn !== "直行") {
                 state.pathSteps.push({
                     icon: turn === "右转" ? "↪️" : turn === "左转" ? "↩️" : "🔄",
                     instruction: `${turn}，直行 ${dist} 米`,
                     hint: hint,
                     floor: seg.floor,
-                    pathPos: [path[0][0], path[0][1]],
+                    pathPos: startPos,
                     direction: s.dir,
                     isTurn: true,
                 });
@@ -528,12 +525,10 @@ function generateSteps(segments, startRoom, endRoom) {
                     instruction: `直行 ${dist} 米`,
                     hint: hint,
                     floor: seg.floor,
-                    pathPos: [path[0][0], path[0][1]],
+                    pathPos: startPos,
                     direction: s.dir,
                 });
             }
-            // 更新外层 facing
-            facing = stepFacing;
         }
 
         // 换层提示（上楼/下楼时更新朝向）
