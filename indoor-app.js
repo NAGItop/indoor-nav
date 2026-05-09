@@ -472,9 +472,11 @@ function generateSteps(segments, startRoom, endRoom) {
         const path = seg.path;
         const isLastSeg = si === segments.length - 1;
 
-        // 分析路径，生成相对转向步骤
+        // 分析路径，生成相对转向步骤（转向合并到下一步直行中）
         let lastDir  = null;
         let runDist  = 0;
+        let pendingTurn = null;    // 待合并的转向动作
+        let pendingTurnPos = null; // 转向发生的位置
 
         for (let i = 1; i < path.length; i++) {
             const [r1,c1] = path[i-1];
@@ -484,57 +486,51 @@ function generateSteps(segments, startRoom, endRoom) {
             if (dir === lastDir) {
                 runDist++;
             } else {
+                // 方向变化：先输出之前的直行（如果有）
+                if (lastDir !== null && runDist > 0) {
+                    state.pathSteps.push({
+                        icon: "⬆️",
+                        instruction: `直行 ${(runDist * 0.5).toFixed(1)} 米`,
+                        hint: getNearbyHint(r1, c1, seg.floor),
+                        floor: seg.floor,
+                        pathPos: [r1, c1],
+                        direction: lastDir,
+                    });
+                }
+                // 计算转向，暂存
                 if (lastDir !== null) {
-                    // 转向 + 直行合并为一步
                     const turn = getRelativeTurn(facing, dir);
                     if (turn !== "直行") {
-                        state.pathSteps.push({
-                            icon: "⬆️",
-                            instruction: `${turn}，直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
-                            hint: getNearbyHint(r1, c1, seg.floor),
-                            floor: seg.floor,
-                            pathPos: [r1, c1],
-                            direction: dir,
-                            isTurn: true,
-                        });
+                        pendingTurn = turn;
+                        pendingTurnPos = [r1, c1];
                         facing = updateFacing(facing, turn);
-                    } else {
-                        // 直行无转向，正常播报
-                        state.pathSteps.push({
-                            icon: "⬆️",
-                            instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
-                            hint: getNearbyHint(r1, c1, seg.floor),
-                            floor: seg.floor,
-                            pathPos: [r1, c1],
-                            direction: dir,
-                        });
                     }
                 }
                 runDist = 0;
                 lastDir = dir;
             }
         }
-        // 最后一段（到达前）
-        if (lastDir !== null) {
+        // 最后一段直行（如果有待合并的转向，一起输出）
+        if (lastDir !== null && runDist >= 0) {
             const [lr, lc] = path[path.length - 1];
-            const finalTurn = getRelativeTurn(facing, lastDir);
-            if (finalTurn !== "直行") {
-                // 合并转向+直行
+            const dist = ((runDist + 1) * 0.5).toFixed(1);
+            const hint = isLastSeg ? "即将到达目的地" : "前方即是楼梯间";
+            if (pendingTurn) {
                 state.pathSteps.push({
-                    icon: "⬆️",
-                    instruction: `${finalTurn}，直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
-                    hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
+                    icon: pendingTurn === "右转" ? "↪️" : pendingTurn === "左转" ? "↩️" : "🔄",
+                    instruction: `${pendingTurn}，直行 ${dist} 米`,
+                    hint: `${hint}（${getNearbyHint(pendingTurnPos[0], pendingTurnPos[1], seg.floor) || ''}）`,
                     floor: seg.floor,
-                    pathPos: [lr, lc],
+                    pathPos: pendingTurnPos,
                     direction: lastDir,
                     isTurn: true,
                 });
-                facing = updateFacing(facing, finalTurn);
+                pendingTurn = null;
             } else {
                 state.pathSteps.push({
                     icon: "⬆️",
-                    instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
-                    hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
+                    instruction: `直行 ${dist} 米`,
+                    hint: hint,
                     floor: seg.floor,
                     pathPos: [lr, lc],
                     direction: lastDir,
@@ -2503,8 +2499,11 @@ function speakCurrentStep() {
         playStepSound();
         hapticFeedback("medium");
     } else if (step.isTurn) {
-        // 合并步骤：直接播报"左转，直行 X.X 米"，不加冗余提示
-        text = `${step.instruction}${step.hint ? '，' + step.hint : ''}`;
+        // 转向+直行合并步骤：强调方向
+        const turnText = step.instruction;
+        const turnEmphasis = turnText.includes("左转") ? "注意左侧通道。" :
+                            turnText.includes("右转") ? "注意右侧通道。" : "";
+        text = `${turnText}。${turnEmphasis}`;
         playStepSound();
         hapticFeedback("light");
     } else {
