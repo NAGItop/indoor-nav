@@ -566,14 +566,23 @@ function generateSteps(segments, startRoom, endRoom) {
         }
     }
 
-    // 到达（最后一步：进入房间）
-    state.pathSteps.push({
-        icon: "🎯",
-        instruction: `到达 ${endRoom.name}`,
-        hint: endRoom.desc,
-        floor: endRoom.floor,
-        isArrival: true,
-    });
+    // 调试：记录 generateSteps 生成的步骤，帮助定位 isArrival 标错问题
+    console.log('[generateSteps] pathSteps before arrival:', state.pathSteps.map((s,i) => `#${i} ${s.instruction} isArrival=${!!s.isArrival} isFloorChange=${!!s.isFloorChange}`));
+
+    // 安全检查：如果已有 isArrival 步骤，不再重复添加（防止 bug 导致重复）
+    const alreadyHasArrival = state.pathSteps.some(s => s.isArrival);
+    if (alreadyHasArrival) {
+        console.error('[Bug] pathSteps 中已存在 isArrival 步骤，跳过重複添加', state.pathSteps);
+    } else {
+        // 到达（最后一步：进入房间）
+        state.pathSteps.push({
+            icon: "🎯",
+            instruction: `到达 ${endRoom.name}`,
+            hint: endRoom.desc,
+            floor: endRoom.floor,
+            isArrival: true,
+        });
+    }
 
     renderSteps();
 }
@@ -2492,14 +2501,23 @@ function speakCurrentStep() {
     const step = state.pathSteps[state.currentStep];
     if (!step) return;
 
+    // 安全防护：isArrival 只应在最后一步，否则是 generateSteps 的 bug
+    const isRealArrival = step.isArrival && state.currentStep === state.pathSteps.length - 1;
+
     // 根据步骤类型强化语音提示
     let text;
 
-    if (step.isArrival) {
+    if (isRealArrival) {
         // 到达目的地：强提示
         text = `🎉 已到达目的地：${step.instruction.replace('到达 ', '')}！${step.hint}`;
         playSuccessSound();
         hapticFeedback("success");
+    } else if (step.isArrival) {
+        // Bug: isArrival 标在了非最后一步，按普通步骤播报
+        console.error('[Bug] isArrival 在错误步骤:', state.currentStep, '/', state.pathSteps.length, step);
+        text = `第 ${state.currentStep+1} 步：${step.instruction}。${step.hint}`;
+        playStepSound();
+        hapticFeedback("light");
     } else if (step.isFloorChange) {
         // 换层：强调楼层
         const floorWord = step.toFloor > step.fromFloor ? "上楼" : "下楼";
