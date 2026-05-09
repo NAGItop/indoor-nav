@@ -442,11 +442,11 @@ function updateFacing(currentFacing, turnAction) {
 
 // 推断用户从房间出来时的初始朝向（面向走廊内侧）
 function getInitialFacing(roomDoorR, roomDoorC, floor) {
-    // 检查门在哪个过道
-    if (roomDoorR === 5) return "S"; // 北过道，门朝南（从房间出来面向南）
-    if (roomDoorR === 9) return "N"; // 南过道，门朝北
-    if (roomDoorC === 0) return "E"; // 西侧入口，面向东
+    // 注意：判断顺序很重要，要先判断列再判断行，避免大门[5,0]被row=5误判
+    if (roomDoorC === 0) return "E"; // 西侧入口（大门），面向东
     if (roomDoorC === 24) return "W"; // 东侧楼梯入口，面向西
+    if (roomDoorR === 5) return "S"; // 北过道房间，门朝南（从房间出来面向南）
+    if (roomDoorR === 9) return "N"; // 南过道房间，门朝北
     return "E"; // 默认朝东
 }
 
