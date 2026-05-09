@@ -472,11 +472,11 @@ function generateSteps(segments, startRoom, endRoom) {
         const path = seg.path;
         const isLastSeg = si === segments.length - 1;
 
-        // 分析路径，生成相对转向步骤（转向合并到下一步直行中）
+        // 分析路径：先收集每段方向+距离，再统一生成步骤
         let lastDir  = null;
         let runDist  = 0;
-        let pendingTurn = null;    // 待合并的转向动作
-        let pendingTurnPos = null; // 转向发生的位置
+        // segs 数组：每项 { dir, dist }（dist = 格数）
+        const segs = [];
 
         for (let i = 1; i < path.length; i++) {
             const [r1,c1] = path[i-1];
@@ -486,56 +486,54 @@ function generateSteps(segments, startRoom, endRoom) {
             if (dir === lastDir) {
                 runDist++;
             } else {
-                // 方向变化：先输出之前的直行（如果有）
-                if (lastDir !== null && runDist > 0) {
-                    state.pathSteps.push({
-                        icon: "⬆️",
-                        instruction: `直行 ${(runDist * 0.5).toFixed(1)} 米`,
-                        hint: getNearbyHint(r1, c1, seg.floor),
-                        floor: seg.floor,
-                        pathPos: [r1, c1],
-                        direction: lastDir,
-                    });
-                }
-                // 计算转向，暂存
                 if (lastDir !== null) {
-                    const turn = getRelativeTurn(facing, dir);
-                    if (turn !== "直行") {
-                        pendingTurn = turn;
-                        pendingTurnPos = [r1, c1];
-                        facing = updateFacing(facing, turn);
-                    }
+                    segs.push({ dir: lastDir, dist: runDist });
                 }
                 runDist = 0;
                 lastDir = dir;
             }
         }
-        // 最后一段直行（如果有待合并的转向，一起输出）
-        if (lastDir !== null && runDist >= 0) {
-            const [lr, lc] = path[path.length - 1];
-            const dist = ((runDist + 1) * 0.5).toFixed(1);
-            const hint = isLastSeg ? "即将到达目的地" : "前方即是楼梯间";
-            if (pendingTurn) {
+        if (lastDir !== null) {
+            segs.push({ dir: lastDir, dist: runDist });
+        }
+
+        // 根据段落生成步骤（转向合并到下一步直行）
+        let stepFacing = facing; // 复制一份，不污染外层
+        for (let si2 = 0; si2 < segs.length; si2++) {
+            const s = segs[si2];
+            const turn = si2 === 0 ? "直行" : getRelativeTurn(stepFacing, s.dir);
+            if (turn !== "直行") {
+                stepFacing = updateFacing(stepFacing, turn);
+            }
+            const dist = (s.dist * 0.5).toFixed(1);
+            const isLastSegStep = (si2 === segs.length - 1);
+            const hint = isLastSegStep ? (isLastSeg ? "即将到达目的地" : "前方即是楼梯间") : getNearbyHint(
+                si2 < segs.length ? path[1][0] : path[path.length-1][0],
+                si2 < segs.length ? path[1][1] : path[path.length-1][1],
+                seg.floor
+            );
+            if (turn !== "直行") {
                 state.pathSteps.push({
-                    icon: pendingTurn === "右转" ? "↪️" : pendingTurn === "左转" ? "↩️" : "🔄",
-                    instruction: `${pendingTurn}，直行 ${dist} 米`,
-                    hint: `${hint}（${getNearbyHint(pendingTurnPos[0], pendingTurnPos[1], seg.floor) || ''}）`,
+                    icon: turn === "右转" ? "↪️" : turn === "左转" ? "↩️" : "🔄",
+                    instruction: `${turn}，直行 ${dist} 米`,
+                    hint: hint,
                     floor: seg.floor,
-                    pathPos: pendingTurnPos,
-                    direction: lastDir,
+                    pathPos: [path[0][0], path[0][1]],
+                    direction: s.dir,
                     isTurn: true,
                 });
-                pendingTurn = null;
             } else {
                 state.pathSteps.push({
                     icon: "⬆️",
                     instruction: `直行 ${dist} 米`,
                     hint: hint,
                     floor: seg.floor,
-                    pathPos: [lr, lc],
-                    direction: lastDir,
+                    pathPos: [path[0][0], path[0][1]],
+                    direction: s.dir,
                 });
             }
+            // 更新外层 facing
+            facing = stepFacing;
         }
 
         // 换层提示（上楼/下楼时更新朝向）
