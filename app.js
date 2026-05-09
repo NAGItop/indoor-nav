@@ -155,6 +155,41 @@ function _playWithAudio(url) {
     });
 }
 
+// ============================================
+// 语音播报队列（防止重叠）
+// ============================================
+let _speechQueue = [];
+let _isSpeaking = false;
+
+async function _doSpeak(text) {
+    _ensureAudioCtx();
+
+    if (_isMobile()) {
+        const ok = await _speakWithBrowser(text);
+        if (ok) return;
+    }
+
+    const ok = await _speakWithBaidu(text);
+    if (ok) return;
+
+    await _speakWithBrowser(text);
+}
+
+async function _processSpeechQueue() {
+    if (_isSpeaking || _speechQueue.length === 0) return;
+
+    _isSpeaking = true;
+    const { text, resolve } = _speechQueue.shift();
+
+    try { await _doSpeak(text); } catch(e) {}
+    _isSpeaking = false;
+    resolve();
+
+    if (_speechQueue.length > 0) {
+        setTimeout(() => _processSpeechQueue(), 100);
+    }
+}
+
 // 百度TTS（多级降级）
 async function _speakWithBaidu(text) {
     _ensureAudioCtx();
@@ -186,22 +221,14 @@ async function _speakWithBaidu(text) {
 }
 
 // 主播报函数：移动端优先 speechSynthesis，电脑端优先百度TTS
+// 通过队列确保同一时间只有一个声音在播放
 async function speakText(text) {
     if (!text) return;
-    _ensureAudioCtx();
 
-    if (_isMobile()) {
-        // 移动端直接用系统语音，零延迟
-        const ok = await _speakWithBrowser(text);
-        if (ok) return;
-    }
-
-    // 电脑端（或移动端降级）：百度TTS
-    const ok = await _speakWithBaidu(text);
-    if (ok) return;
-
-    // 兜底
-    await _speakWithBrowser(text);
+    return new Promise((resolve) => {
+        _speechQueue.push({ text, resolve });
+        _processSpeechQueue();
+    });
 }
 
 // 首次用户交互时解锁音频（在绑定事件之前设置）
@@ -307,20 +334,15 @@ function updateClock() {
 }
 
 /**
- * 显示状态消息 - 带语音朗读支持
+ * 显示状态消息 - 不再自动语音播报，由业务函数自行控制
  */
 function showStatus(message, type = "info") {
     const statusEl = document.getElementById("statusMessage");
     if (!statusEl) return;
-    
+
     statusEl.textContent = message;
     statusEl.className = `status-toast is-${type}`;
-    
-    // 语音朗读（百度 TTS 优先，兼容微信 WebView）
-    if (state.settings?.voiceEnabled) {
-        speakText(message);
-    }
-    
+
     // 3秒后自动清除
     setTimeout(() => {
         statusEl.textContent = "";

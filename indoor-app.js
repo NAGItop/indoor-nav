@@ -1881,10 +1881,8 @@ async function processVoiceCommand(text) {
     // 显示识别结果到语音面板
     const resultEl = document.querySelector('#voicePanel .voice-text');
     if (resultEl) {
-        resultEl.textContent = '识别到：' + (text || '（无内容）');
+        resultEl.textContent = text || '（未识别到内容）';
     }
-    // 播报识别内容，让用户确认
-    if (text) speak('识别到：' + text);
 
     // ===== 第一优先：AI 智能理解 =====
     updateVoiceStatus('thinking');
