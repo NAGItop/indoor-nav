@@ -485,29 +485,30 @@ function generateSteps(segments, startRoom, endRoom) {
                 runDist++;
             } else {
                 if (lastDir !== null) {
-                    // 先转向（如果需要）
+                    // 转向 + 直行合并为一步
                     const turn = getRelativeTurn(facing, dir);
                     if (turn !== "直行") {
                         state.pathSteps.push({
-                            icon: turn === "右转" ? "↪️" : turn === "左转" ? "↩️" : "🔄",
-                            instruction: `${turn}`,
-                            hint: "注意前方转角",
+                            icon: "⬆️",
+                            instruction: `${turn}，直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
+                            hint: getNearbyHint(r1, c1, seg.floor),
                             floor: seg.floor,
                             pathPos: [r1, c1],
                             direction: dir,
                             isTurn: true,
                         });
                         facing = updateFacing(facing, turn);
+                    } else {
+                        // 直行无转向，正常播报
+                        state.pathSteps.push({
+                            icon: "⬆️",
+                            instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
+                            hint: getNearbyHint(r1, c1, seg.floor),
+                            floor: seg.floor,
+                            pathPos: [r1, c1],
+                            direction: dir,
+                        });
                     }
-                    // 再直行
-                    state.pathSteps.push({
-                        icon: "⬆️",
-                        instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
-                        hint: getNearbyHint(r1, c1, seg.floor),
-                        floor: seg.floor,
-                        pathPos: [r1, c1],
-                        direction: dir,
-                    });
                 }
                 runDist = 0;
                 lastDir = dir;
@@ -516,12 +517,12 @@ function generateSteps(segments, startRoom, endRoom) {
         // 最后一段（到达前）
         if (lastDir !== null) {
             const [lr, lc] = path[path.length - 1];
-            // 最后转向到达目的地
             const finalTurn = getRelativeTurn(facing, lastDir);
             if (finalTurn !== "直行") {
+                // 合并转向+直行
                 state.pathSteps.push({
-                    icon: finalTurn === "右转" ? "↪️" : finalTurn === "左转" ? "↩️" : "🔄",
-                    instruction: `${finalTurn}`,
+                    icon: "⬆️",
+                    instruction: `${finalTurn}，直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
                     hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
                     floor: seg.floor,
                     pathPos: [lr, lc],
@@ -529,15 +530,16 @@ function generateSteps(segments, startRoom, endRoom) {
                     isTurn: true,
                 });
                 facing = updateFacing(facing, finalTurn);
+            } else {
+                state.pathSteps.push({
+                    icon: "⬆️",
+                    instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
+                    hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
+                    floor: seg.floor,
+                    pathPos: [lr, lc],
+                    direction: lastDir,
+                });
             }
-            state.pathSteps.push({
-                icon: "⬆️",
-                instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
-                hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
-                floor: seg.floor,
-                pathPos: [lr, lc],
-                direction: lastDir,
-            });
         }
 
         // 换层提示（上楼/下楼时更新朝向）
@@ -2501,11 +2503,8 @@ function speakCurrentStep() {
         playStepSound();
         hapticFeedback("medium");
     } else if (step.isTurn) {
-        // 转向：强调方向
-        const turnText = step.instruction;
-        const turnEmphasis = turnText.includes("左转") ? "请沿走廊左侧通行。" :
-                            turnText.includes("右转") ? "请沿走廊右侧通行。" : "请注意转角处。";
-        text = `${turnText}。${turnEmphasis}`;
+        // 合并步骤：直接播报"左转，直行 X.X 米"，不加冗余提示
+        text = `${step.instruction}${step.hint ? '，' + step.hint : ''}`;
         playStepSound();
         hapticFeedback("light");
     } else {
