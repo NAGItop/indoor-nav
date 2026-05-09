@@ -510,10 +510,11 @@ function generateSteps(segments, startRoom, endRoom) {
             const dist     = (s.count * 0.5).toFixed(1);
 
             // 计算下一段的转向（预告用）
+            // 注意：必须用当前段的方向 s.dir，不能用 facing（facing 是上一段的方向）
             let nextTurnText = '';
             if (!isLast) {
                 const nextDir = dirSegs[dsi + 1].dir;
-                const nextTurn = getRelativeTurn(facing, nextDir);
+                const nextTurn = getRelativeTurn(s.dir, nextDir);
                 if (nextTurn !== "直行") {
                     nextTurnText = `，然后${nextTurn}`;
                 }
