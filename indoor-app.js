@@ -472,6 +472,12 @@ function generateSteps(segments, startRoom, endRoom) {
         const path = seg.path;
         const isLastSeg = si === segments.length - 1;
 
+        // 如果当前是连续换层的中间层（前一个segment也是换层），跳过路径步骤
+        if (si > 0 && segments[si - 1].stairTaken && seg.stairTaken) {
+            // 不生成路径步骤，换层提示已由第一个换层segment合并生成
+            continue;
+        }
+
         // 分析路径：收集连续相同方向的段，每段 = {dir, count, startIdx}
         // count = 该方向的边数（不是格数）
         const dirSegs = [];
@@ -531,19 +537,27 @@ function generateSteps(segments, startRoom, endRoom) {
             facing = s.dir;
         }
 
-        // 换层提示（上楼/下楼时更新朝向）
+        // 换层提示：合并连续换层（如1楼→3楼只显示"上楼至3楼"）
         if (seg.stairTaken) {
-            const nextFloor = segments[si+1]?.floor;
+            // 向后扫描，找到连续换层的最终目标楼层
+            let finalFloor = segments[si+1]?.floor;
+            let scanIdx = si + 1;
+            while (scanIdx < segments.length && segments[scanIdx].stairTaken) {
+                finalFloor = segments[scanIdx + 1]?.floor;
+                scanIdx++;
+            }
+            if (!finalFloor) finalFloor = segments[si+1]?.floor;
+
             const stairName = STAIR_NODES[seg.stairTaken]?.name || "楼梯间";
-            const upOrDown  = nextFloor > seg.floor ? "上楼" : "下楼";
+            const upOrDown  = finalFloor > seg.floor ? "上楼" : "下楼";
             state.pathSteps.push({
-                icon: nextFloor > seg.floor ? "⬆️🪜" : "⬇️🪜",
-                instruction: `${upOrDown}至 ${nextFloor} 楼`,
-                hint: `经过 ${stairName}，${upOrDown}到第 ${nextFloor} 层，注意扶手`,
+                icon: finalFloor > seg.floor ? "⬆️🪜" : "⬇️🪜",
+                instruction: `${upOrDown}至 ${finalFloor} 楼`,
+                hint: `进入${stairName.replace('🪜 ','')}，${upOrDown}到第 ${finalFloor} 层，注意扶手`,
                 floor: seg.floor,
                 isFloorChange: true,
                 fromFloor: seg.floor,
-                toFloor: nextFloor,
+                toFloor: finalFloor,
                 pathPos: [path[path.length-1][0], path[path.length-1][1]],
             });
             // 上楼后，假设用户面向与楼梯入口相反的方向（进入走廊）
