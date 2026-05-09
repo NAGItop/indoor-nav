@@ -495,42 +495,40 @@ function generateSteps(segments, startRoom, endRoom) {
             }
         }
 
-        // 根据段落生成步骤（转向合并到下一步直行）
+        // 根据段落生成步骤
+        // 策略：在每一段直行末尾，预告下一段的转向（"直行 X 米，然后左转"）
         for (let dsi = 0; dsi < dirSegs.length; dsi++) {
             const s = dirSegs[dsi];
-            const turn = dsi === 0 ? "直行" : getRelativeTurn(facing, s.dir);
-            if (turn !== "直行") {
-                facing = updateFacing(facing, turn);
-            }
-            const dist     = (s.count * 0.5).toFixed(1);
             const isLast   = (dsi === dirSegs.length - 1);
             const startPos = path[s.startIdx];
-            const hint     = isLast
+            const dist     = (s.count * 0.5).toFixed(1);
+
+            // 计算下一段的转向（预告用）
+            let nextTurnText = '';
+            if (!isLast) {
+                const nextDir = dirSegs[dsi + 1].dir;
+                const nextTurn = getRelativeTurn(facing, nextDir);
+                if (nextTurn !== "直行") {
+                    nextTurnText = `，然后${nextTurn}`;
+                }
+            }
+
+            const hint = isLast
                 ? (isLastSeg ? "即将到达目的地" : "前方即是楼梯间")
                 : getNearbyHint(startPos[0], startPos[1], seg.floor);
 
-            if (turn !== "直行") {
-                // 转向合并到直行后面：先直行到转向点，再转向
-                const turnText = isLast ? `${turn}` : `${turn}`;
-                state.pathSteps.push({
-                    icon: turn === "右转" ? "↪️" : turn === "左转" ? "↩️" : "🔄",
-                    instruction: `直行 ${dist} 米，${isLast ? '然后' : '然后'}${turnText}`,
-                    hint: hint,
-                    floor: seg.floor,
-                    pathPos: startPos,
-                    direction: s.dir,
-                    isTurn: true,
-                });
-            } else {
-                state.pathSteps.push({
-                    icon: "⬆️",
-                    instruction: `直行 ${dist} 米`,
-                    hint: hint,
-                    floor: seg.floor,
-                    pathPos: startPos,
-                    direction: s.dir,
-                });
-            }
+            state.pathSteps.push({
+                icon: "⬆️",
+                instruction: `直行 ${dist} 米${nextTurnText}`,
+                hint: hint,
+                floor: seg.floor,
+                pathPos: startPos,
+                direction: s.dir,
+                isTurn: !!nextTurnText,
+            });
+
+            // 本段结束后，更新朝向为当前段的方向（为下一段的预告做准备）
+            facing = s.dir;
         }
 
         // 换层提示（上楼/下楼时更新朝向）
