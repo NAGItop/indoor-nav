@@ -1,0 +1,2685 @@
+/**
+ * 室内导航系统 v3.0 — 多楼层版
+ * ─────────────────────────────────────────────
+ * 架构：
+ *   · 每层有独立的二维地图网格 (0=墙, 1=走廊, 2=教室, 3=楼梯, 4=卫生间, 5=办公室)
+ *   · 楼梯节点 (type=3) 在多层中位置相同，作为层间传送点
+ *   · 跨层寻路：本层找楼梯 → 换层 → 继续寻路到终点
+ *   · 步进导航会提示上楼/下楼指令
+ */
+
+// ============================================
+// 地图配置
+// ============================================
+const MAP_CONFIG = {
+    cellSize: 22,
+    colors: {
+        0: null,            // 墙壁 = 背景色（不绘制）
+        1: "#1a2744",       // 走廊
+        2: "#1e3a5f",       // 教室
+        3: "#2d4a1e",       // 楼梯间
+        4: "#1a3320",       // 卫生间
+        5: "#2d1a3a",       // 办公室
+    },
+    wallColor:      "#050a14",
+    pathColor:      "#3b82f6",
+    startColor:     "#10b981",
+    endColor:       "#f97316",
+    stairLinkColor: "#f59e0b",
+};
+
+// ============================================
+// 地图生成辅助
+// ============================================
+function makeGrid(rows, cols) {
+    return Array.from({ length: rows }, () => new Array(cols).fill(0));
+}
+
+function fill(grid, r1, c1, r2, c2, val) {
+    for (let r = r1; r <= r2; r++)
+        for (let c = c1; c <= c2; c++)
+            grid[r][c] = val;
+}
+
+function hLine(grid, row, c1, c2, val = 1) { fill(grid, row, c1, row, c2, val); }
+function vLine(grid, col, r1, r2, val = 1) { fill(grid, r1, col, r2, col, val); }
+
+// ============================================
+// 地图数据定义
+// ============================================
+/*
+  每层地图尺寸：21行 × 27列
+  布局（每层相同结构，房间功能不同）：
+
+  行号  内容
+  ───  ───────────────────────────────────────
+   0   外墙
+  1-4  北侧房间区（3个房间）
+   5   北侧房门过道（与走廊相通）
+  6-8  主横向走廊（贯穿左右）
+   9   南侧房门过道
+  10-13 南侧房间区（3个房间）
+  14-15 中间分隔
+  16-17 中央走廊区（连接出口/楼梯）
+  18-19 楼梯/出口区
+  20   外墙
+
+  列号  内容
+  ───  ───────────────────────────────────────
+   0   外墙
+  1-6  房间A
+   7   竖向走廊（贯穿上下）
+  8-15  房间B / 中央走廊
+  16  竖向走廊
+  17-22 房间C
+  23  竖向走廊（主通道）
+  24  外墙/隔离
+  25-26 楼梯间（独立区域，不干扰主通道）
+
+  楼梯间固定在：[2,25] 和 [18,25] —— 完全独立于走廊系统
+  所有路径在列1-23的走廊网络中进行，绝不穿过房间或楼梯间
+*/
+
+const ROWS = 21, COLS = 27;
+
+function buildFloor(roomDefs) {
+    // roomDefs: [{r1,c1,r2,c2,type,doorR,doorC}, ...]
+    const g = makeGrid(ROWS, COLS);
+
+    // ═══════════════════════════════════════════════════════
+    // 走廊系统（列1-23，完全独立于楼梯间）
+    // ═══════════════════════════════════════════════════════
+
+    // ── 主横向走廊（行6-8，列1-23）──────────────
+    fill(g, 6, 1, 8, 23, 1);
+
+    // ── 竖向走廊（精简为两条主要通道）───────────
+    vLine(g,  1, 1, 13, 1);   // 最左（列1）— 连接西侧大门和南北过道
+    vLine(g, 23, 5, 9,  1);   // 最右（列23）— 仅连接两个过道到楼梯入口
+
+    // ── 北侧横向过道（行5，连接房间门）─────────
+    hLine(g, 5, 1, 23, 1);
+
+    // ── 南侧横向过道（行9，连接房间门）─────────
+    hLine(g, 9, 1, 23, 1);
+
+    // ═══════════════════════════════════════════════════════
+    // 楼梯间系统（列25-26，完全隔离于主走廊）
+    // ═══════════════════════════════════════════════════════
+
+    // 楼梯间A（北侧）: 行1-4, 列25-26
+    fill(g, 1, 25, 4, 26, 3);
+    // 楼梯间B（南侧）: 行10-13, 列25-26 —— 北移到南过道附近
+    fill(g, 10, 25, 13, 26, 3);
+
+    // 楼梯入口（连接走廊与楼梯间的通道）
+    // 北侧楼梯入口在北过道（行5）
+    g[5][24]  = 1;
+    // 南侧楼梯入口在南过道（行9）
+    g[9][24] = 1;
+
+    // ═══════════════════════════════════════════════════════
+    // 房间填充
+    // ═══════════════════════════════════════════════════════
+    for (const rd of roomDefs) {
+        fill(g, rd.r1, rd.c1, rd.r2, rd.c2, rd.type);
+        // 房门（门洞打通到走廊）— 门必须在过道行（5或9）
+        g[rd.doorR][rd.doorC] = 1;
+    }
+
+    return g;
+}
+
+// 在一楼地图的西侧打通入口（列0）
+function addEntrance(floorMap, entranceDef) {
+    // entranceDef: { doorR, doorC }
+    // 在西墙（列0）打通入口，连接到主横向走廊（行6-8）
+    const { doorR, doorC } = entranceDef;
+    // 入口位置设为走廊
+    floorMap[doorR][doorC] = 1;
+    // 从入口向右连接到列1的竖向走廊
+    if (doorC === 0) {
+        // 横向打通到列1
+        for (let c = 0; c <= 1; c++) {
+            floorMap[doorR][c] = 1;
+        }
+    }
+}
+
+// 每层房间定义
+// 北侧房间（行1-4）: 3个
+// 南侧房间（行10-13）: 3个
+const FLOOR_DEFS = {
+    1: { // 一楼：入口大厅、登记处、服务台
+        rooms: [
+            // 北侧
+            { r1:1, c1:1,  r2:4, c2:6,  type:2, doorR:5,  doorC:3,  id:"r1_101", name:"📚 101教室", desc:"一楼大教室，可容纳80人" },
+            { r1:1, c1:8,  r2:4, c2:15, type:5, doorR:5,  doorC:11, id:"r1_off1",name:"🏢 一楼办公室",desc:"教务办公室，负责选课事务" },
+            { r1:1, c1:17, r2:4, c2:22, type:2, doorR:5,  doorC:19, id:"r1_102", name:"📚 102教室", desc:"一楼小教室，可容纳40人" },
+            // 南侧
+            { r1:10, c1:1,  r2:13, c2:6,  type:4, doorR:9, doorC:3,  id:"r1_wc",  name:"🚻 卫生间",  desc:"无障碍卫生间，设有扶手" },
+            { r1:10, c1:8,  r2:13, c2:15, type:2, doorR:9, doorC:11, id:"r1_103", name:"📚 103教室", desc:"一楼多媒体教室" },
+            { r1:10, c1:17, r2:13, c2:22, type:2, doorR:9, doorC:19, id:"r1_104", name:"📚 104教室", desc:"一楼实验教室" },
+        ],
+        entrance: { id:"r1_entrance", name:"🚪 一楼大门", doorR:7, doorC:0, desc:"教学楼西侧正门入口，设有无障碍坡道" }
+    },
+    2: { // 二楼：普通教室
+        rooms: [
+            { r1:1, c1:1,  r2:4, c2:6,  type:2, doorR:5,  doorC:3,  id:"r2_201", name:"📚 201教室", desc:"二楼大教室，可容纳80人" },
+            { r1:1, c1:8,  r2:4, c2:15, type:2, doorR:5,  doorC:11, id:"r2_202", name:"📚 202教室", desc:"二楼中教室，可容纳60人" },
+            { r1:1, c1:17, r2:4, c2:22, type:2, doorR:5,  doorC:19, id:"r2_203", name:"📚 203教室", desc:"二楼小教室，可容纳40人" },
+            { r1:10, c1:1,  r2:13, c2:6,  type:2, doorR:9, doorC:3,  id:"r2_204", name:"📚 204教室", desc:"二楼东侧教室" },
+            { r1:10, c1:8,  r2:13, c2:15, type:5, doorR:9, doorC:11, id:"r2_off1",name:"🏢 二楼办公室",desc:"系所办公室，负责学籍管理" },
+            { r1:10, c1:17, r2:13, c2:22, type:4, doorR:9, doorC:19, id:"r2_wc",  name:"🚻 卫生间",  desc:"二楼无障碍卫生间" },
+        ],
+        entrance: null
+    },
+    3: { // 三楼：实验室、计算机室
+        rooms: [
+            { r1:1, c1:1,  r2:4, c2:6,  type:2, doorR:5,  doorC:3,  id:"r3_301", name:"🔬 实验室",  desc:"理化实验室，进入须穿防护服" },
+            { r1:1, c1:8,  r2:4, c2:15, type:2, doorR:5,  doorC:11, id:"r3_302", name:"💻 计算机室", desc:"配备60台电脑" },
+            { r1:1, c1:17, r2:4, c2:22, type:2, doorR:5,  doorC:19, id:"r3_303", name:"📚 303教室", desc:"三楼小教室，可容纳40人" },
+            { r1:10, c1:1,  r2:13, c2:6,  type:5, doorR:9, doorC:3,  id:"r3_off1",name:"🏢 三楼办公室",desc:"研究生导师办公室" },
+            { r1:10, c1:8,  r2:13, c2:15, type:2, doorR:9, doorC:11, id:"r3_304", name:"📚 304教室", desc:"三楼多媒体教室" },
+            { r1:10, c1:17, r2:13, c2:22, type:4, doorR:9, doorC:19, id:"r3_wc",  name:"🚻 卫生间",  desc:"三楼无障碍卫生间" },
+        ],
+        entrance: null
+    }
+};
+
+// 构建三层地图
+const FLOOR_MAPS = {};
+const FLOOR_ROOMS = {};   // floor -> room[]
+const STAIR_NODES = {     // 楼梯节点固定坐标（在走廊侧的入口点）
+    // 注意：楼梯间本身在列25-26，但导航到"楼梯"是指到达楼梯入口（列24）
+    // 北侧入口在北过道（行5），南侧入口在南过道（行9）
+    // 这样上楼后直接在过道里，可以立即转向目标房间
+    stairA: { r: 5, c: 24, name: "🪜 北侧楼梯间", actualStairC: 25 },
+    stairB: { r: 9, c: 24, name: "🪜 南侧楼梯间", actualStairC: 25 },
+};
+
+for (const [floorStr, def] of Object.entries(FLOOR_DEFS)) {
+    const floor = Number(floorStr);
+    FLOOR_MAPS[floor] = buildFloor(def.rooms);
+
+    const rooms = def.rooms.map(rd => ({
+        id:    rd.id,
+        name:  rd.name,
+        floor,
+        door:  [rd.doorR, rd.doorC],
+        desc:  rd.desc,
+        type:  rd.type,
+    }));
+
+    // 楼梯节点（每层都有，作为层间连接点）
+    for (const [sid, sn] of Object.entries(STAIR_NODES)) {
+        rooms.push({
+            id:    `${sid}_f${floor}`,
+            name:  sn.name,
+            floor,
+            door:  [sn.r, sn.c],
+            desc:  `${sn.name}，可到达第${floor > 1 ? floor-1 : ''}${floor < 3 ? '、'+(floor+1) : ''}层`,
+            type:  3,
+            isStair: true,
+            stairId: sid,
+        });
+    }
+
+    // 入口（仅一楼）
+    if (def.entrance) {
+        const e = def.entrance;
+        // 打通入口到走廊
+        addEntrance(FLOOR_MAPS[floor], { doorR: e.doorR, doorC: e.doorC });
+        rooms.push({
+            id:    e.id,
+            name:  e.name,
+            floor,
+            door:  [e.doorR, e.doorC],
+            desc:  e.desc,
+            type:  1,
+        });
+    }
+
+    // 确保楼梯入口在地图中可行（列24是走廊，列25-26是楼梯间）
+    FLOOR_MAPS[floor][STAIR_NODES.stairA.r][STAIR_NODES.stairA.c] = 1;  // 入口是走廊
+    FLOOR_MAPS[floor][STAIR_NODES.stairB.r][STAIR_NODES.stairB.c] = 1;  // 入口是走廊
+    // 楼梯间本身（列25-26）保持为3（楼梯类型），不参与寻路
+
+    // 修补门洞（确保所有门在地图中可行）
+    for (const rd of def.rooms) {
+        FLOOR_MAPS[floor][rd.doorR][rd.doorC] = 1;
+    }
+    if (def.entrance) {
+        FLOOR_MAPS[floor][def.entrance.doorR][def.entrance.doorC] = 1;
+    }
+
+    FLOOR_ROOMS[floor] = rooms;
+}
+
+// 平铺所有房间（用于选择器），排除纯楼梯节点
+const ALL_ROOMS = Object.values(FLOOR_ROOMS).flat().filter(r => !r.isStair);
+
+// ============================================
+// 状态管理
+// ============================================
+const state = {
+    canvas: null,
+    ctx: null,
+    scale: 1,
+    offsetX: 0,
+    offsetY: 0,
+    isDragging: false,
+    lastX: 0,
+    lastY: 0,
+
+    viewFloor: 1,           // 当前显示的楼层
+    startRoomId: null,
+    endRoomId: null,
+    pathSegments: [],       // [{floor, path:[...]}]
+    currentStep: 0,
+    pathSteps: [],
+    voiceEnabled: true,  // 默认开启语音
+    animOffset: 0,
+    animFrame: null,
+};
+
+// 每个路段对应的步骤索引范围，供 drawCurrentPosition 定位
+const SEG_STEP_RANGE = [];
+
+// ============================================
+// A* 单层寻路
+// ============================================
+function astar(floorMap, start, end) {
+    const rows = floorMap.length;
+    const cols = floorMap[0].length;
+    const key  = (r, c) => `${r},${c}`;
+
+    const open   = new Map();
+    const closed = new Set();
+    const gScore = {};
+    const parent = {};
+
+    const sk = key(start[0], start[1]);
+    gScore[sk] = 0;
+    open.set(sk, { pos: start, f: Math.abs(start[0]-end[0]) + Math.abs(start[1]-end[1]) });
+
+    const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
+
+    while (open.size > 0) {
+        let cur = null, curKey = null, minF = Infinity;
+        for (const [k, v] of open) {
+            if (v.f < minF) { minF = v.f; cur = v.pos; curKey = k; }
+        }
+
+        if (cur[0] === end[0] && cur[1] === end[1]) {
+            const path = [];
+            let k = curKey;
+            while (k) { path.unshift(k.split(",").map(Number)); k = parent[k]; }
+            return path;
+        }
+
+        open.delete(curKey);
+        closed.add(curKey);
+
+        for (const [dr, dc] of dirs) {
+            const nr = cur[0] + dr, nc = cur[1] + dc;
+            if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+            if (floorMap[nr][nc] === 0) continue;   // 墙壁不可通行
+            const nk = key(nr, nc);
+            if (closed.has(nk)) continue;
+            const g = (gScore[curKey] || 0) + 1;
+            if (g < (gScore[nk] ?? Infinity)) {
+                gScore[nk] = g;
+                parent[nk] = curKey;
+                open.set(nk, {
+                    pos: [nr, nc],
+                    f: g + Math.abs(nr-end[0]) + Math.abs(nc-end[1])
+                });
+            }
+        }
+    }
+    return null;
+}
+
+// ============================================
+// 跨楼层寻路
+// ============================================
+/**
+ * 返回 pathSegments:
+ * [
+ *   { floor: 1, path: [[r,c],...], stairTaken: "stairA"|null },
+ *   { floor: 2, path: [[r,c],...], stairTaken: null },
+ *   ...
+ * ]
+ */
+function planMultiFloorRoute(startRoom, endRoom) {
+    // 同楼层
+    if (startRoom.floor === endRoom.floor) {
+        const path = astar(FLOOR_MAPS[startRoom.floor], startRoom.door, endRoom.door);
+        if (!path) return null;
+        return [{ floor: startRoom.floor, path, stairTaken: null }];
+    }
+
+    const segments = [];
+    let currentFloor  = startRoom.floor;
+    let currentPos    = startRoom.door;
+    const targetFloor = endRoom.floor;
+    const direction   = targetFloor > currentFloor ? 1 : -1;
+
+    while (currentFloor !== targetFloor) {
+        const floorMap = FLOOR_MAPS[currentFloor];
+
+        // 找最近的可达楼梯
+        let bestStairId   = null;
+        let bestStairPath = null;
+        let bestLen       = Infinity;
+
+        for (const [sid, sn] of Object.entries(STAIR_NODES)) {
+            const stairPos  = [sn.r, sn.c];
+            const pathToStair = astar(floorMap, currentPos, stairPos);
+            if (pathToStair && pathToStair.length < bestLen) {
+                bestLen       = pathToStair.length;
+                bestStairId   = sid;
+                bestStairPath = pathToStair;
+            }
+        }
+
+        if (!bestStairPath) return null;   // 找不到楼梯
+
+        segments.push({ floor: currentFloor, path: bestStairPath, stairTaken: bestStairId });
+        currentFloor += direction;
+        currentPos    = STAIR_NODES[bestStairId];  // 新楼层起点 = 同位置楼梯口
+        currentPos    = [currentPos.r, currentPos.c];
+    }
+
+    // 最后一段：当前楼层 → 终点
+    const lastPath = astar(FLOOR_MAPS[currentFloor], currentPos, endRoom.door);
+    if (!lastPath) return null;
+    segments.push({ floor: currentFloor, path: lastPath, stairTaken: null });
+
+    return segments;
+}
+
+// ============================================
+// 步进导航生成（相对转向版）
+// ============================================
+// 方向：N=北(上), S=南(下), E=东(右), W=西(左)
+const DIR_DELTA = { N: [-1, 0], S: [1, 0], E: [0, 1], W: [0, -1] };
+
+function getDir(r1, c1, r2, c2) {
+    if (r2 < r1) return "N";
+    if (r2 > r1) return "S";
+    if (c2 > c1) return "E";
+    if (c2 < c1) return "W";
+    return null;
+}
+
+// 根据当前朝向和目标方向，返回相对转向
+function getRelativeTurn(currentFacing, targetDir) {
+    // currentFacing: 当前面朝方向
+    // targetDir: 想要去的方向
+    // 返回: "直行", "左转", "右转", "掉头"
+    if (currentFacing === targetDir) return "直行";
+    const order = ["N", "E", "S", "W"];
+    const fromIdx = order.indexOf(currentFacing);
+    const toIdx = order.indexOf(targetDir);
+    const diff = (toIdx - fromIdx + 4) % 4;
+    if (diff === 1) return "右转";
+    if (diff === 3) return "左转";
+    if (diff === 2) return "掉头";
+    return "直行";
+}
+
+// 根据转向动作，更新朝向
+function updateFacing(currentFacing, turnAction) {
+    const order = ["N", "E", "S", "W"];
+    const idx = order.indexOf(currentFacing);
+    if (turnAction === "右转") return order[(idx + 1) % 4];
+    if (turnAction === "左转") return order[(idx + 3) % 4];
+    if (turnAction === "掉头") return order[(idx + 2) % 4];
+    return currentFacing; // 直行不改变朝向
+}
+
+// 推断用户从房间出来时的初始朝向（面向走廊内侧）
+function getInitialFacing(roomDoorR, roomDoorC, floor) {
+    // 检查门在哪个过道
+    if (roomDoorR === 5) return "S"; // 北过道，门朝南（从房间出来面向南）
+    if (roomDoorR === 9) return "N"; // 南过道，门朝北
+    if (roomDoorC === 0) return "E"; // 西侧入口，面向东
+    if (roomDoorC === 24) return "W"; // 东侧楼梯入口，面向西
+    return "E"; // 默认朝东
+}
+
+function generateSteps(segments, startRoom, endRoom) {
+    state.pathSteps   = [];
+    state.currentStep = 0;
+    SEG_STEP_RANGE.length = 0;  // 清空
+
+    // 推断初始朝向
+    let facing = getInitialFacing(startRoom.door[0], startRoom.door[1], startRoom.floor);
+
+    // 出发（起点位置）
+    state.pathSteps.push({
+        icon: "🚪",
+        instruction: `从 ${startRoom.name} 出发`,
+        hint: startRoom.desc,
+        floor: startRoom.floor,
+        pathPos: [segments[0].path[0][0], segments[0].path[0][1]],
+    });
+
+    for (let si = 0; si < segments.length; si++) {
+        const seg = segments[si];
+        const path = seg.path;
+        const isLastSeg = si === segments.length - 1;
+
+        // 分析路径，生成相对转向步骤
+        let lastDir  = null;
+        let runDist  = 0;
+
+        for (let i = 1; i < path.length; i++) {
+            const [r1,c1] = path[i-1];
+            const [r2,c2] = path[i];
+            const dir = getDir(r1,c1,r2,c2);
+
+            if (dir === lastDir) {
+                runDist++;
+            } else {
+                if (lastDir !== null) {
+                    // 先转向（如果需要）
+                    const turn = getRelativeTurn(facing, dir);
+                    if (turn !== "直行") {
+                        state.pathSteps.push({
+                            icon: turn === "右转" ? "↪️" : turn === "左转" ? "↩️" : "🔄",
+                            instruction: `${turn}`,
+                            hint: "注意前方转角",
+                            floor: seg.floor,
+                            pathPos: [r1, c1],
+                            direction: dir,
+                            isTurn: true,
+                        });
+                        facing = updateFacing(facing, turn);
+                    }
+                    // 再直行
+                    state.pathSteps.push({
+                        icon: "⬆️",
+                        instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
+                        hint: getNearbyHint(r1, c1, seg.floor),
+                        floor: seg.floor,
+                        pathPos: [r1, c1],
+                        direction: dir,
+                    });
+                }
+                runDist = 0;
+                lastDir = dir;
+            }
+        }
+        // 最后一段（到达前）
+        if (lastDir !== null) {
+            const [lr, lc] = path[path.length - 1];
+            // 最后转向到达目的地
+            const finalTurn = getRelativeTurn(facing, lastDir);
+            if (finalTurn !== "直行") {
+                state.pathSteps.push({
+                    icon: finalTurn === "右转" ? "↪️" : finalTurn === "左转" ? "↩️" : "🔄",
+                    instruction: `${finalTurn}`,
+                    hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
+                    floor: seg.floor,
+                    pathPos: [lr, lc],
+                    direction: lastDir,
+                    isTurn: true,
+                });
+                facing = updateFacing(facing, finalTurn);
+            }
+            state.pathSteps.push({
+                icon: "⬆️",
+                instruction: `直行 ${((runDist+1)*0.5).toFixed(1)} 米`,
+                hint: isLastSeg ? "即将到达目的地" : "前方即是楼梯间",
+                floor: seg.floor,
+                pathPos: [lr, lc],
+                direction: lastDir,
+            });
+        }
+
+        // 换层提示（上楼/下楼时更新朝向）
+        if (seg.stairTaken) {
+            const nextFloor = segments[si+1]?.floor;
+            const stairName = STAIR_NODES[seg.stairTaken]?.name || "楼梯间";
+            const upOrDown  = nextFloor > seg.floor ? "上楼" : "下楼";
+            state.pathSteps.push({
+                icon: nextFloor > seg.floor ? "⬆️🪜" : "⬇️🪜",
+                instruction: `${upOrDown}至 ${nextFloor} 楼`,
+                hint: `经过 ${stairName}，${upOrDown}到第 ${nextFloor} 层，注意扶手`,
+                floor: seg.floor,
+                isFloorChange: true,
+                fromFloor: seg.floor,
+                toFloor: nextFloor,
+                pathPos: [path[path.length-1][0], path[path.length-1][1]],
+            });
+            // 上楼后，假设用户面向与楼梯入口相反的方向（进入走廊）
+            facing = "W";
+        }
+    }
+
+    // 到达（最后一步：进入房间）
+    state.pathSteps.push({
+        icon: "🎯",
+        instruction: `到达 ${endRoom.name}`,
+        hint: endRoom.desc,
+        floor: endRoom.floor,
+        isArrival: true,
+    });
+
+    renderSteps();
+}
+
+function getNearbyHint(r, c, floor) {
+    const floorRooms = FLOOR_ROOMS[floor] || [];
+    const nearby = floorRooms.find(room => {
+        const [dr, dc] = room.door;
+        return Math.abs(dr - r) + Math.abs(dc - c) <= 2;
+    });
+    if (nearby) return `经过 ${nearby.name} 门口`;
+    const val = FLOOR_MAPS[floor]?.[r]?.[c];
+    if (val === 3) return "经过楼梯间，注意安全";
+    if (val === 4) return "经过卫生间";
+    return "沿走廊前行";
+}
+
+// ============================================
+// Canvas 渲染
+// ============================================
+function initCanvas() {
+    state.canvas = document.getElementById("mapCanvas");
+    if (!state.canvas) return;
+    state.ctx    = state.canvas.getContext("2d");
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+    bindCanvasEvents();
+    startLoop();
+}
+
+function resizeCanvas() {
+    const cont = state.canvas.parentElement;
+    const dpr  = window.devicePixelRatio || 1;
+    const cssW = cont.clientWidth;
+    const cssH = cont.clientHeight;
+    // 物理像素 = CSS像素 × DPR，解决高清屏模糊问题
+    state.canvas.width  = cssW * dpr;
+    state.canvas.height = cssH * dpr;
+    // CSS 尺寸保持不变，让布局正常
+    state.canvas.style.width  = cssW + "px";
+    state.canvas.style.height = cssH + "px";
+    // 缩放上下文，后续所有绘制仍以 CSS 像素为单位
+    state.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // 保存 CSS 尺寸供布局计算使用
+    state.cssWidth  = cssW;
+    state.cssHeight = cssH;
+    fitView();
+}
+
+function fitView() {
+    const mapW = COLS * MAP_CONFIG.cellSize;
+    const mapH = ROWS * MAP_CONFIG.cellSize;
+    // 使用 CSS 尺寸（ctx 已 scale(dpr) 处理），保证布局正确
+    const w = state.cssWidth  || state.canvas.width;
+    const h = state.cssHeight || state.canvas.height;
+    const sx = w / mapW;
+    const sy = h / mapH;
+    state.scale   = Math.min(sx, sy) * 0.92;
+    state.offsetX = (w - mapW * state.scale) / 2;
+    state.offsetY = (h - mapH * state.scale) / 2;
+}
+
+function startLoop() {
+    const tick = () => {
+        state.animOffset = (state.animOffset + 0.4) % 20;
+        render();
+        state.animFrame = requestAnimationFrame(tick);
+    };
+    state.animFrame = requestAnimationFrame(tick);
+}
+
+// ── 交互事件 ──────────────────────────────────
+function bindCanvasEvents() {
+    state.canvas.addEventListener("mousedown",  e => { e.preventDefault(); state.isDragging=true; const p=getPoint(e); state.lastX=p.x; state.lastY=p.y; });
+    state.canvas.addEventListener("touchstart", e => { e.preventDefault(); state.isDragging=true; const p=getPoint(e); state.lastX=p.x; state.lastY=p.y; }, { passive:false });
+    window.addEventListener("mousemove",  e => { if(!state.isDragging) return; const p=getPoint(e); state.offsetX+=p.x-state.lastX; state.offsetY+=p.y-state.lastY; state.lastX=p.x; state.lastY=p.y; });
+    window.addEventListener("touchmove",  e => { if(!state.isDragging) return; e.preventDefault(); const p=getPoint(e); state.offsetX+=p.x-state.lastX; state.offsetY+=p.y-state.lastY; state.lastX=p.x; state.lastY=p.y; }, { passive:false });
+    window.addEventListener("mouseup",    () => state.isDragging=false);
+    window.addEventListener("touchend",   () => state.isDragging=false);
+    state.canvas.addEventListener("wheel", e => {
+        e.preventDefault();
+        const d = e.deltaY > 0 ? 0.9 : 1.1;
+        const ns = Math.max(0.4, Math.min(5, state.scale * d));
+        const rect = state.canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+        state.offsetX = mx - (mx - state.offsetX) * (ns / state.scale);
+        state.offsetY = my - (my - state.offsetY) * (ns / state.scale);
+        state.scale   = ns;
+    }, { passive:false });
+}
+
+function getPoint(e) {
+    if (e.touches?.length > 0) return { x:e.touches[0].clientX, y:e.touches[0].clientY };
+    return { x:e.clientX, y:e.clientY };
+}
+
+// ── 主渲染 ────────────────────────────────────
+function render() {
+    const ctx  = state.ctx;
+    if (!ctx) return;
+    const cell = MAP_CONFIG.cellSize * state.scale;
+    const floor = state.viewFloor;
+    const floorMap = FLOOR_MAPS[floor];
+
+    // 背景（墙色）
+    const canvasW = state.cssWidth  || state.canvas.width;
+    const canvasH = state.cssHeight || state.canvas.height;
+    ctx.fillStyle = MAP_CONFIG.wallColor;
+    ctx.fillRect(0, 0, canvasW, canvasH);
+
+    // 绘制格子
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const val = floorMap[r][c];
+            if (val === 0) continue;
+            const color = MAP_CONFIG.colors[val];
+            if (!color) continue;
+            ctx.fillStyle = color;
+            const x = state.offsetX + c * cell;
+            const y = state.offsetY + r * cell;
+            ctx.fillRect(x + 0.5, y + 0.5, cell - 1, cell - 1);
+        }
+    }
+
+    // 绘制当前楼层的路径段
+    const seg = state.pathSegments.find(s => s.floor === floor);
+    if (seg) {
+        drawPath(ctx, cell, seg.path);
+        // 路径方向小箭头
+        drawPathArrows(ctx, cell, seg.path);
+    }
+
+    // 绘制当前位置指示器（脉冲点）
+    drawCurrentPosition(ctx, cell);
+
+    // 绘制楼梯标记（换层点高亮）
+    for (const [sid, sn] of Object.entries(STAIR_NODES)) {
+        const isUsed = state.pathSegments.some(s => s.stairTaken === sid);
+        drawStairMark(ctx, cell, sn, isUsed);
+    }
+
+    // 起终点标记（如果在当前楼层）
+    const startRoom = ALL_ROOMS.find(r => r.id === state.startRoomId);
+    const endRoom   = ALL_ROOMS.find(r => r.id === state.endRoomId);
+    if (startRoom?.floor === floor) drawMarker(ctx, cell, startRoom.door, MAP_CONFIG.startColor, "S");
+    if (endRoom?.floor   === floor) drawMarker(ctx, cell, endRoom.door,   MAP_CONFIG.endColor,   "E");
+
+    // 房间标签
+    drawRoomLabels(ctx, cell, floor);
+
+    // 楼层指示
+    drawFloorIndicator(ctx, floor);
+}
+
+function drawPath(ctx, cell, path) {
+    if (!path || path.length < 2) return;
+    ctx.save();
+    // 光晕
+    ctx.shadowColor = "rgba(59,130,246,0.6)";
+    ctx.shadowBlur  = 14;
+    ctx.strokeStyle = "rgba(59,130,246,0.3)";
+    ctx.lineWidth   = Math.max(5, cell * 0.4);
+    ctx.lineCap = ctx.lineJoin = "round";
+    ctx.beginPath();
+    path.forEach(([r,c],i) => {
+        const x = state.offsetX + c * cell + cell/2;
+        const y = state.offsetY + r * cell + cell/2;
+        i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    // 主线（流动虚线）
+    ctx.shadowBlur  = 0;
+    ctx.strokeStyle = MAP_CONFIG.pathColor;
+    ctx.lineWidth   = Math.max(2.5, cell * 0.18);
+    ctx.setLineDash([cell*0.5, cell*0.35]);
+    ctx.lineDashOffset = -state.animOffset * (cell/12);
+    ctx.beginPath();
+    path.forEach(([r,c],i) => {
+        const x = state.offsetX + c * cell + cell/2;
+        const y = state.offsetY + r * cell + cell/2;
+        i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+}
+
+function drawMarker(ctx, cell, [r,c], color, label) {
+    const x = state.offsetX + c * cell + cell/2;
+    const y = state.offsetY + r * cell + cell/2;
+    const radius = Math.max(8, cell * 0.48);
+    ctx.save();
+    ctx.shadowColor = color; ctx.shadowBlur = 18;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(x, y, radius*0.42, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = color;
+    ctx.font = `bold ${radius*0.85}px Arial`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.shadowBlur = 0;
+    ctx.fillText(label, x, y);
+    ctx.restore();
+}
+
+function drawStairMark(ctx, cell, stairNode, highlighted) {
+    const x = state.offsetX + stairNode.c * cell + cell/2;
+    const y = state.offsetY + stairNode.r * cell + cell/2;
+    const r = Math.max(6, cell * 0.38);
+    ctx.save();
+    ctx.fillStyle = highlighted ? MAP_CONFIG.stairLinkColor : "rgba(245,158,11,0.4)";
+    if (highlighted) { ctx.shadowColor = MAP_CONFIG.stairLinkColor; ctx.shadowBlur = 12; }
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${r}px Arial`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.shadowBlur = 0;
+    ctx.fillText("🪜", x, y);
+    ctx.restore();
+}
+
+// ── 当前导航位置指示器（脉冲动画点）──
+function drawCurrentPosition(ctx, cell) {
+    if (state.pathSteps.length === 0) return;
+    const step = state.pathSteps[state.currentStep];
+    if (!step?.pathPos) return;
+
+    const [r, c] = step.pathPos;
+    // 如果当前步骤不在当前楼层，不显示
+    if (step.floor !== state.viewFloor) return;
+
+    const x = state.offsetX + c * cell + cell/2;
+    const y = state.offsetY + r * cell + cell/2;
+    const baseRadius = Math.max(7, cell * 0.4);
+
+    ctx.save();
+
+    // 外圈脉冲（根据时间动画）
+    const pulse = Math.sin(state.animOffset * 0.1) * 0.5 + 0.5;  // 0~1
+    const outerRadius = baseRadius * (1.2 + pulse * 0.5);
+    const outerAlpha = 0.3 + pulse * 0.4;
+
+    ctx.fillStyle = `rgba(16, 185, 129, ${outerAlpha})`;  // startColor
+    ctx.beginPath();
+    ctx.arc(x, y, outerRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 内圈实心点
+    ctx.shadowColor = "#10b981";
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = "#10b981";
+    ctx.beginPath();
+    ctx.arc(x, y, baseRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 白色中心
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.arc(x, y, baseRadius * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 转向指示箭头（如果这一步有方向）
+    if (step.direction) {
+        drawNavArrow(ctx, x, y, step.direction, cell);
+    }
+
+    ctx.restore();
+}
+
+// ── 导航方向箭头（朝向指示）──
+function drawNavArrow(ctx, cx, cy, direction, cell) {
+    const arrowSize = Math.max(6, cell * 0.35);
+    const DIR_ANGLES = { N: -Math.PI/2, S: Math.PI/2, E: 0, W: Math.PI };
+    const angle = DIR_ANGLES[direction];
+    if (angle === undefined) return;
+
+    // 箭头画在内圈下方（相对于前进方向）
+    const offsetDist = cell * 0.3;
+    const ax = cx + Math.cos(angle) * offsetDist;
+    const ay = cy + Math.sin(angle) * offsetDist;
+
+    ctx.save();
+    ctx.translate(ax, ay);
+    ctx.rotate(angle);
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.moveTo(arrowSize, 0);
+    ctx.lineTo(-arrowSize * 0.5, -arrowSize * 0.6);
+    ctx.lineTo(-arrowSize * 0.5, arrowSize * 0.6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+}
+
+// ── 绘制路径上的方向小箭头（沿路径均匀分布）──
+function drawPathArrows(ctx, cell, path, step) {
+    if (!path || path.length < 2) return;
+
+    const arrowCount = Math.min(path.length - 1, 8);  // 最多8个
+    const stepIdx = Math.floor(path.length / (arrowCount + 1));
+
+    for (let i = 1; i <= arrowCount; i++) {
+        const idx = i * stepIdx;
+        if (idx >= path.length) break;
+        const [r, c] = path[idx];
+        const nextIdx = Math.min(idx + 1, path.length - 1);
+        const [nr, nc] = path[nextIdx];
+
+        // 判断方向
+        let dir;
+        if (nr < r) dir = "N";
+        else if (nr > r) dir = "S";
+        else if (nc > c) dir = "E";
+        else if (nc < c) dir = "W";
+
+        const x = state.offsetX + c * cell + cell/2;
+        const y = state.offsetY + r * cell + cell/2;
+
+        drawSmallArrow(ctx, x, y, dir, cell);
+    }
+}
+
+function drawSmallArrow(ctx, cx, cy, direction, cell) {
+    const DIR_ANGLES = { N: -Math.PI/2, S: Math.PI/2, E: 0, W: Math.PI };
+    const angle = DIR_ANGLES[direction];
+    if (angle === undefined) return;
+
+    const size = Math.max(4, cell * 0.2);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    ctx.fillStyle = "rgba(59, 130, 246, 0.7)";
+    ctx.beginPath();
+    ctx.moveTo(size, 0);
+    ctx.lineTo(-size * 0.4, -size * 0.5);
+    ctx.lineTo(-size * 0.4, size * 0.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+}
+
+function drawRoomLabels(ctx, cell, floor) {
+    if (cell < 7) return;
+    ctx.save();
+    ctx.font = `bold ${Math.max(7, cell * 0.5)}px "Microsoft YaHei", sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(255,255,255,0.8)";
+    const def = FLOOR_DEFS[floor];
+    if (!def) { ctx.restore(); return; }
+    for (const rd of def.rooms) {
+        // 房间中心 = 两端格子中点
+        const cr = (rd.r1 + rd.r2) / 2;
+        const cc = (rd.c1 + rd.c2) / 2;
+        const x  = state.offsetX + cc * cell + cell/2;
+        const y  = state.offsetY + cr * cell + cell/2;
+        // 获取房间名（去除emoji）
+        const room = FLOOR_ROOMS[floor]?.find(r => r.id === rd.id);
+        const shortName = (room?.name || rd.id).replace(/[\u{1F000}-\u{1FFFF}]|[\u2600-\u27FF]/gu,"").trim();
+        ctx.fillText(shortName, x, y);
+    }
+    ctx.restore();
+}
+
+function drawFloorIndicator(ctx, floor) {
+    ctx.save();
+    ctx.font = "bold 14px 'Microsoft YaHei', sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.textAlign  = "right";
+    ctx.textBaseline = "top";
+    ctx.fillText(`当前显示：第 ${floor} 层`, (state.cssWidth || state.canvas.width) - 12, 12);
+    ctx.restore();
+}
+
+// ============================================
+// 路线规划主逻辑
+// ============================================
+function initSelectors() {
+    const startSel = document.getElementById("startSelect");
+    const endSel   = document.getElementById("endSelect");
+    if (!startSel || !endSel) return;
+
+    // 按楼层分组
+    for (let f = 1; f <= 3; f++) {
+        const gStart = document.createElement("optgroup");
+        const gEnd   = document.createElement("optgroup");
+        gStart.label = gEnd.label = `第 ${f} 层`;
+        for (const room of ALL_ROOMS.filter(r => r.floor === f)) {
+            gStart.appendChild(new Option(room.name, room.id));
+            gEnd.appendChild(new Option(room.name, room.id));
+        }
+        startSel.appendChild(gStart);
+        endSel.appendChild(gEnd);
+    }
+
+    // 默认值
+    startSel.value = "r1_entrance";
+    endSel.value   = "r1_101";
+}
+
+function planRoute() {
+    // 移动端：首次点击时初始化音频（用户交互后才能播放声音）
+    if (state.voiceEnabled) {
+        initAudio();
+    }
+    
+    const startId = document.getElementById("startSelect")?.value;
+    const endId   = document.getElementById("endSelect")?.value;
+
+    if (!startId || !endId) { showResult("请选择起点和终点", "error"); return; }
+    if (startId === endId)  { showResult("起点和终点不能相同", "error"); return; }
+
+    const startRoom = ALL_ROOMS.find(r => r.id === startId);
+    const endRoom   = ALL_ROOMS.find(r => r.id === endId);
+    if (!startRoom || !endRoom) { showResult("位置信息无效", "error"); return; }
+
+    // 验证门坐标
+    const [sr,sc] = startRoom.door;
+    const [er,ec] = endRoom.door;
+    if (FLOOR_MAPS[startRoom.floor]?.[sr]?.[sc] === 0) {
+        showResult(`起点"${startRoom.name}"的出口被墙壁阻挡，请重新选择`, "error"); return;
+    }
+    if (FLOOR_MAPS[endRoom.floor]?.[er]?.[ec] === 0) {
+        showResult(`终点"${endRoom.name}"的出口被墙壁阻挡，请重新选择`, "error"); return;
+    }
+
+    const segments = planMultiFloorRoute(startRoom, endRoom);
+    state.startRoomId = startId;
+    state.endRoomId   = endId;
+
+    if (!segments || segments.length === 0) {
+        state.pathSegments = [];
+        showResult("未找到可行路线，请检查起终点选择", "error");
+        speak("未找到可行路线，请重新选择");
+        return;
+    }
+
+    state.pathSegments = segments;
+
+    // 切换地图到起点楼层
+    switchToFloor(startRoom.floor);
+    // 更新楼层徽章（显示目标和起点楼层）
+    updateFloorBadge(startRoom.floor, endRoom.floor);
+
+    // 统计总步数和距离
+    const totalSteps = segments.reduce((s, seg) => s + seg.path.length, 0);
+    const floorChanges = segments.length - 1;
+    const distance = (totalSteps * 0.5).toFixed(1);
+
+    const floorInfo = floorChanges > 0
+        ? `<span class="route-info-detail">🪜 途经 ${floorChanges} 次换层</span>`
+        : `<span class="route-info-detail">📐 单层路线</span>`;
+
+    showResult(`
+        <div class="route-info">
+            <div class="route-info-header"><span>✅</span>路线已规划</div>
+            <div class="route-info-details">
+                <span class="route-info-detail">📍 ${startRoom.name}（${startRoom.floor}层）</span>
+                <span>→</span>
+                <span class="route-info-detail">🎯 ${endRoom.name}（${endRoom.floor}层）</span>
+                <span class="route-info-detail">📏 约 ${distance} 米</span>
+                ${floorInfo}
+            </div>
+        </div>
+    `, "success");
+
+    generateSteps(segments, startRoom, endRoom);
+    speak(`路线已规划，从${startRoom.name}出发，${floorChanges > 0 ? `途经${floorChanges}次换层，` : ""}前往${endRoom.name}，全程约${distance}米。`);
+    playSuccessSound(); // 播放成功提示音
+    showStepPanel();
+    hapticFeedback("success");
+}
+
+function clearRoute() {
+    state.pathSegments = [];
+    state.startRoomId  = null;
+    state.endRoomId    = null;
+    state.pathSteps    = [];
+    state.currentStep  = 0;
+    document.getElementById("startSelect").value = "";
+    document.getElementById("endSelect").value   = "";
+    showResult(`<div class="result-placeholder"><span class="placeholder-icon">🗺️</span><p>选择起点和终点后点击"开始规划路线"</p></div>`);
+    hideStepPanel();
+    updateFloorBadge(state.viewFloor);
+    speak("路线已清除");
+}
+
+function showResult(html, type = "info") {
+    const box = document.getElementById("routeResult");
+    if (box) { box.innerHTML = html; box.className = `route-result is-${type}`; }
+}
+
+function swapLocations() {
+    const s = document.getElementById("startSelect");
+    const e = document.getElementById("endSelect");
+    if (!s || !e) return;
+    [s.value, e.value] = [e.value, s.value];
+    hapticFeedback("light");
+}
+
+// ============================================
+// 楼层切换
+// ============================================
+function switchToFloor(floor) {
+    state.viewFloor = floor;
+    // 更新楼层选择器高亮
+    document.querySelectorAll(".floor-btn").forEach(btn => {
+        btn.classList.toggle("is-active", Number(btn.dataset.floor) === floor);
+    });
+    // 更新地图右上角楼层徽章
+    updateFloorBadge(floor);
+    // 通知屏幕阅读器
+    const liveRegion = document.getElementById("floorAnnounce");
+    if (liveRegion) liveRegion.textContent = `正在查看第 ${floor} 层平面图`;
+}
+
+function updateFloorBadge(floor, destFloor) {
+    const badge = document.getElementById("floorBadge");
+    if (!badge) return;
+    let html = `<span class="floor-badge-current">${floor}F</span>`;
+    if (destFloor && destFloor !== floor) {
+        html += `<span class="floor-badge-route">目标 ${destFloor}F</span>`;
+    }
+    badge.innerHTML = html;
+}
+
+function initFloorButtons() {
+    document.querySelectorAll(".floor-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+            const f = Number(btn.dataset.floor);
+            switchToFloor(f);
+            hapticFeedback("light");
+        });
+    });
+    // 默认显示一楼
+    switchToFloor(1);
+}
+
+// ============================================
+// 步进面板
+// ============================================
+function renderSteps() {
+    const stepList = document.getElementById("stepList");
+    if (!stepList) return;
+
+    stepList.innerHTML = state.pathSteps.map((step, idx) => {
+        const isActive = idx === state.currentStep;
+        const isTurn = step.isTurn;
+        const isArrival = step.isArrival;
+        const isFloorChange = step.isFloorChange;
+
+        // 步骤类型样式
+        const typeClass = isArrival ? "is-arrival" :
+                         isFloorChange ? "is-floor-change" :
+                         isTurn ? "is-turn" : "";
+
+        const floorTag = isFloorChange
+            ? `<span class="step-floor-tag is-change">换层 → ${step.toFloor}楼</span>`
+            : `<span class="step-floor-tag">${step.floor}楼</span>`;
+
+        // 到达步骤特殊图标
+        const icon = isArrival ? "🎊" : isFloorChange ? (step.toFloor > step.fromFloor ? "⬆️" : "⬇️") : step.icon;
+
+        return `
+            <div class="step-item ${typeClass} ${isActive ? "is-active" : ""}" data-index="${idx}">
+                <span class="step-number">${isArrival ? "★" : idx + 1}</span>
+                <div class="step-content">
+                    <div class="step-instruction">${icon} ${step.instruction}</div>
+                    <div class="step-hint">${step.hint}</div>
+                </div>
+                ${floorTag}
+            </div>
+        `;
+    }).join("");
+
+    updateStepCounter();
+
+    // 滚动到当前步骤
+    stepList.querySelector(".is-active")?.scrollIntoView({ behavior:"smooth", block:"center" });
+
+    // 如果是换层步骤，自动切换地图
+    const cur = state.pathSteps[state.currentStep];
+    if (cur?.isFloorChange && cur.toFloor) {
+        switchToFloor(cur.toFloor);
+    } else if (cur?.floor) {
+        switchToFloor(cur.floor);
+    }
+}
+
+function showStepPanel()  { document.getElementById("stepPanel")?.classList.remove("is-hidden"); }
+function hideStepPanel()  { document.getElementById("stepPanel")?.classList.add("is-hidden"); }
+
+function nextStep() {
+    if (state.currentStep < state.pathSteps.length - 1) {
+        state.currentStep++;
+        renderSteps();
+        render();  // 刷新地图上的当前位置指示器
+        speakCurrentStep();
+    }
+}
+
+function prevStep() {
+    if (state.currentStep > 0) {
+        state.currentStep--;
+        renderSteps();
+        render();  // 刷新地图上的当前位置指示器
+        speakCurrentStep();
+    }
+}
+
+function updateStepCounter() {
+    const counter = document.getElementById("stepCounter");
+    const prevBtn = document.getElementById("prevStep");
+    const nextBtn = document.getElementById("nextStep");
+    if (counter) counter.textContent = `${state.currentStep+1} / ${state.pathSteps.length}`;
+    if (prevBtn) prevBtn.disabled = state.currentStep === 0;
+    if (nextBtn) nextBtn.disabled = state.currentStep === state.pathSteps.length - 1;
+}
+
+// ============================================
+// 语音 & 触觉
+// ============================================
+function toggleVoice() {
+    state.voiceEnabled = !state.voiceEnabled;
+    
+    // 更新按钮显示状态
+    updateVoiceButton();
+    
+    if (state.voiceEnabled) {
+        // 立即初始化并播放（必须在用户点击事件里同步执行）
+        initAudio();
+        playSuccessSound();
+    }
+    hapticFeedback("light");
+}
+
+// 创建简单的提示音（使用 Web Audio API，但简化实现）
+let audioCtx = null;
+
+// 初始化音频（在用户交互时调用）
+function initAudio() {
+    if (!audioCtx) {
+        try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) {
+            console.log('音频不支持');
+        }
+    }
+    return audioCtx;
+}
+
+// 播放提示音
+function playBeep() {
+    if (!state.voiceEnabled) return;
+    
+    const ctx = initAudio();
+    if (!ctx) return;
+    
+    // 恢复音频上下文（移动端必需）
+    if (ctx.state === 'suspended') {
+        ctx.resume();
+    }
+    
+    try {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        
+        osc.type = 'sine';
+        osc.frequency.value = 600; // 降低频率，声音更柔和
+        
+        gain.gain.setValueAtTime(0.2, ctx.currentTime); // 降低音量
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1); // 缩短时长
+        
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.1);
+    } catch (e) {
+        // 忽略错误
+    }
+}
+
+// 播放成功提示音
+function playSuccessSound() {
+    if (!state.voiceEnabled) return;
+    playBeep();
+    setTimeout(() => playBeep(), 120);
+}
+
+// 播放步骤提示音
+function playStepSound() {
+    playBeep();
+}
+
+// 播放特定频率的提示音（用于不同语义）
+function playTone(frequency, duration, type = 'sine') {
+    if (!state.voiceEnabled) return;
+    
+    const ctx = initAudio();
+    if (!ctx) return;
+    
+    if (ctx.state === 'suspended') {
+        ctx.resume();
+    }
+    
+    try {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        
+        osc.type = type;
+        osc.frequency.value = frequency;
+        
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + duration);
+        
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + duration);
+    } catch (e) {
+        // 忽略错误
+    }
+}
+
+// 用不同音调组合模拟"语音导航已开启"
+function playVoiceOnSound() {
+    if (!state.voiceEnabled) return;
+    // 音调序列："语音-导航-已-开启"
+    playTone(523, 0.15); // C5 - 语
+    setTimeout(() => playTone(659, 0.15), 150); // E5 - 音
+    setTimeout(() => playTone(784, 0.2), 350); // G5 - 导
+    setTimeout(() => playTone(659, 0.15), 550); // E5 - 航
+    setTimeout(() => playTone(523, 0.15), 750); // C5 - 已
+    setTimeout(() => playTone(784, 0.25), 950); // G5 - 开
+    setTimeout(() => playTone(1047, 0.3), 1200); // C6 - 启
+}
+
+// ============================================
+// 语音识别模块 — 持续音量监听 + 百度 ASR
+// ============================================
+let voiceListening = false;        // 持续监听是否已启动
+let voiceRecording = false;        // 是否正在录音（MediaRecorder）
+let mediaRecorder = null;          // MediaRecorder 实例
+let audioChunks = [];              // 录音数据块
+let monitorStream = null;          // 持续监听的麦克风流
+let monitorAnalyser = null;        // AnalyserNode（音量检测）
+let silenceTimer = null;           // 静音超时定时器
+let recordTimer = null;            // 最大录音时长定时器
+let cooldownActive = false;        // 冷却中（防止连续触发）
+let voiceInitialized = false;      // 语音模块是否已初始化
+
+// 百度语音识别 API 配置
+const BAIDU_ASR_SAMPLE_RATE = 16000;
+const BAIDU_ASR_CUID = '7664376';
+
+// 监听参数
+const VOICE_THRESHOLD = 5;         // 音量峰值阈值（0-255，高频段），用峰值代替平均值更抗噪
+const SILENCE_DURATION = 1000;     // 静音多久后停止录音（ms），说完即停
+const MAX_RECORD_DURATION = 6000;  // 最大单次录音时长（ms），6秒足够说完指令
+const COOLDOWN_DURATION = 2500;    // 两次识别之间的最小间隔（ms）
+const MIN_RECORD_DURATION = 300;   // 最短录音时长（ms），兼容短指令如"去101"
+
+// 检查是否支持
+function isSpeechRecognitionSupported() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+
+// ── 初始化持续语音监听（页面首次交互时调用）──
+async function initVoiceListener() {
+    if (voiceInitialized || !isSpeechRecognitionSupported()) return;
+    voiceInitialized = true;
+
+    try {
+        // 不指定 sampleRate，让浏览器用设备原生采样率（通常 44100 或 48000）
+        // audioBlobToPCM 会自动重采样到 16kHz
+        monitorStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            }
+        });
+
+        const ctx = initAudio();
+        // 确保 AudioContext 已恢复（浏览器默认 suspended）
+        if (ctx && ctx.state === 'suspended') await ctx.resume();
+
+        const source = ctx.createMediaStreamSource(monitorStream);
+        monitorAnalyser = ctx.createAnalyser();
+        monitorAnalyser.fftSize = 512;
+        monitorAnalyser.smoothingTimeConstant = 0.5;
+        source.connect(monitorAnalyser);
+
+        voiceListening = true;
+        console.log('[语音监听] 已启动（NativeRate: ' + ctx.sampleRate + 'Hz → 重采样到 16000Hz)');
+        updateVoiceStatus('listening');
+        monitorAudioLevel();
+    } catch (e) {
+        console.log('[语音监听] 初始化失败:', e);
+        voiceInitialized = false; // 失败时允许重试
+        if (e.name === 'NotAllowedError') {
+            showResult('请允许麦克风权限以使用语音控制', 'error');
+        } else if (e.name === 'NotFoundError') {
+            showResult('未检测到麦克风设备', 'error');
+        }
+    }
+}
+
+// ── 持续检测音量 ──
+let _dbgLogTimer = 0;
+function monitorAudioLevel() {
+    if (!voiceListening || !monitorAnalyser) return;
+
+    // 语音播报中 → 暂停监听，避免扬声器声音被麦克风拾音
+    if (isSpeaking) {
+        requestAnimationFrame(monitorAudioLevel);
+        return;
+    }
+
+    const bufferLength = monitorAnalyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    monitorAnalyser.getByteFrequencyData(dataArray);
+
+    // 用高频段能量峰值（人声主要在 300Hz~4kHz，对应 fftSize=512@16kHz 约 bins 6~85）
+    // 比全频段均值更稳定，不受空调/风扇低频干扰
+    const nyquist = monitorAnalyser.context.sampleRate / 2;
+    const binHz = nyquist / bufferLength;
+    const lowBin = Math.floor(300 / binHz);
+    const highBin = Math.floor(4000 / binHz);
+    let peak = 0;
+    for (let i = lowBin; i <= highBin && i < bufferLength; i++) {
+        if (dataArray[i] > peak) peak = dataArray[i];
+    }
+
+    // 每秒打印一次音量读数，方便调试
+    _dbgLogTimer++;
+    if (_dbgLogTimer % 60 === 0) {
+        console.log('[音量监控] Peak=' + peak + ' (阈值=' + VOICE_THRESHOLD + ')', '采样率=' + monitorAnalyser.context.sampleRate);
+    }
+
+    const avgVolume = peak; // 用峰值代替平均值
+
+    // 如果正在录音，检测静音
+    if (voiceRecording) {
+        if (avgVolume < VOICE_THRESHOLD) {
+            if (!silenceTimer) {
+                silenceTimer = setTimeout(() => {
+                    // 静音超时，停止录音
+                    console.log('[语音监听] 检测到静音，停止录音');
+                    stopRecording();
+                }, SILENCE_DURATION);
+            }
+        } else {
+            // 还有声音，重置静音计时器
+            if (silenceTimer) {
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+            }
+        }
+    } else if (!cooldownActive && avgVolume > VOICE_THRESHOLD) {
+        // 没在录音也没在冷却 → 检测到声音，开始录音
+        console.log('[语音监听] 检测到声音，开始录音');
+        startRecording();
+    }
+
+    requestAnimationFrame(monitorAudioLevel);
+}
+
+// ── 开始录音（复用 monitorStream，不重新获取麦克风）──
+function startRecording() {
+    if (voiceRecording || cooldownActive) return;
+    voiceRecording = true;
+    audioChunks = [];
+
+    updateVoiceStatus('recording');
+    playBeep();
+
+    const recordStartTime = Date.now();
+
+    try {
+        // 复用 monitorStream，避免每次录音都重新申请麦克风权限
+        let mimeType = 'audio/webm;codecs=pcm';
+        if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/webm';
+        if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/mp4';
+        if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+
+        mediaRecorder = mimeType
+            ? new MediaRecorder(monitorStream, { mimeType })
+            : new MediaRecorder(monitorStream);
+
+        const _recMimeType = mediaRecorder.mimeType || mimeType || 'audio/webm'; // 闭包保存
+        mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+            // 不关闭 monitorStream，保持麦克风权限复用
+            const recordDuration = Date.now() - recordStartTime;
+
+            // 太短了，丢弃（可能是噪音）
+            if (recordDuration < MIN_RECORD_DURATION) {
+                console.log('[语音监听] 录音太短（' + recordDuration + 'ms），丢弃');
+                voiceRecording = false;
+                updateVoiceStatus('listening');
+                return;
+            }
+
+            if (audioChunks.length === 0) {
+                voiceRecording = false;
+                updateVoiceStatus('listening');
+                return;
+            }
+
+            updateVoiceStatus('processing');
+
+            try {
+                const audioBlob = new Blob(audioChunks, { type: _recMimeType });
+                const recognizedText = await recognizeWithBaidu(audioBlob, _recMimeType);
+                console.log('[语音识别] 结果:', recognizedText);
+
+                if (recognizedText) {
+                    await processVoiceCommand(recognizedText);
+                }
+            } catch (e) {
+                console.log('[语音识别] 处理失败:', e.message);
+                // 不频繁报错，但提示用户
+                const errMsg = e.message.includes('超时') ? '识别超时，请重试' : '语音识别失败，请重试';
+                speak(errMsg);
+            }
+
+            // 冷却期
+            voiceRecording = false;
+            cooldownActive = true;
+            updateVoiceStatus('listening');
+
+            setTimeout(() => {
+                cooldownActive = false;
+            }, COOLDOWN_DURATION);
+        };
+
+        mediaRecorder.onerror = (e) => {
+            console.log('[语音监听] MediaRecorder 错误:', e.error);
+            // 不关闭 monitorStream，保持麦克风权限复用
+            voiceRecording = false;
+            updateVoiceStatus('listening');
+        };
+
+        // 最大录音时长限制
+        recordTimer = setTimeout(() => {
+            console.log('[语音监听] 达到最大录音时长，停止');
+            stopRecording();
+        }, MAX_RECORD_DURATION);
+
+        mediaRecorder.start(200);
+    } catch (e) {
+        console.log('[语音监听] 开始录音失败:', e);
+        voiceRecording = false;
+        updateVoiceStatus('listening');
+    }
+}
+
+// ── 停止录音 ──
+function stopRecording() {
+    if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+    }
+    if (recordTimer) {
+        clearTimeout(recordTimer);
+        recordTimer = null;
+    }
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try { mediaRecorder.stop(); } catch(e) {}
+    }
+    mediaRecorder = null;
+}
+
+// ── 更新语音状态指示 ──
+function updateVoiceStatus(status) {
+    const panel = document.getElementById('voicePanel');
+    const waveEl = panel?.querySelector('.voice-wave');
+    const textEl = panel?.querySelector('.voice-text');
+
+    if (panel) {
+        panel.classList.remove('status-listening', 'status-recording', 'status-processing', 'status-thinking');
+        panel.classList.add('status-' + status);
+    }
+
+    if (textEl) {
+        const messages = {
+            'idle':      '🔇 语音功能未启动',
+            'listening': '🎤 正在监听，请说话',
+            'recording': '🔴 正在录音，请继续说话',
+            'processing': '⏳ 正在识别语音...',
+            'thinking':  '🧠 正在理解意图...',
+        };
+        textEl.textContent = messages[status] || messages.listening;
+    }
+}
+
+// ============================================
+// AI 智能意图理解模块
+// ============================================
+
+// 多轮对话历史（最多保留最近6轮，防止 token 超限）
+const conversationHistory = [];
+const MAX_HISTORY_ROUNDS = 6;
+
+// AI 配置（智谱AI，通过自建 Cloudflare Worker 代理）
+// 部署 Worker 后把地址填到这里（步骤见 ai-proxy-worker.js 文件头部注释）
+const AI_PROXY_URL = 'https://fragrant-salad-45ab.t0lloyd0t.workers.dev';
+const AI_TIMEOUT = 12000; // 12秒超时
+
+// 当前导航状态（用于构建 AI context）
+function getNavContext() {
+    const startSel = document.getElementById('startSelect');
+    const endSel = document.getElementById('endSelect');
+    const startRoom = startSel?.value ? ALL_ROOMS.find(r => r.id === startSel.value) : null;
+    const endRoom = endSel?.value ? ALL_ROOMS.find(r => r.id === endSel.value) : null;
+    return {
+        currentFloor: state.viewFloor,
+        startSet: !!startRoom,
+        startName: startRoom?.name || null,
+        endSet: !!endRoom,
+        endName: endRoom?.name || null,
+        hasRoute: state.pathSegments.length > 0,
+        navigating: state.pathSteps.length > 0,
+    };
+}
+
+// 构建房间列表文本（给 AI 的上下文）
+function buildRoomListText() {
+    const lines = [];
+    for (let f = 1; f <= 3; f++) {
+        const rooms = ALL_ROOMS.filter(r => r.floor === f);
+        lines.push(`第${f}层: ${rooms.map(r => r.id + '(' + r.name.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '') + ')').join(', ')}`);
+    }
+    return lines.join('\n');
+}
+
+// 构建系统提示词
+function buildSystemPrompt() {
+    const navCtx = getNavContext();
+    const roomList = buildRoomListText();
+
+    return `你是一个室内导航系统的AI语音助手，专门帮助视障人士在教学楼内导航。
+
+## 你的职责
+1. 理解用户的自然语言指令，判断意图类型
+2. 将模糊的表达转化为精确的导航指令
+3. 支持多轮对话上下文理解（用户可能分两句话说起点和终点）
+4. 识别用户的无障碍求助、闲聊等非导航意图，给出温暖回应
+
+## 教学楼房间列表（房间ID: 名称）
+${roomList}
+
+## 当前导航状态
+- 当前楼层：第${navCtx.currentFloor}层
+- 起点：${navCtx.startSet ? '已设为 ' + navCtx.startName : '未设置'}
+- 终点：${navCtx.endSet ? '已设为 ' + navCtx.endName : '未设置'}
+- 是否有路线：${navCtx.hasRoute ? '是' : '否'}
+- 是否在导航中：${navCtx.navigating ? '是' : '否'}
+
+## 回复格式（必须严格返回 JSON）
+{
+  "intent": "navigate|control|help|chat|switch_floor|sos",
+  "action": "set_start|set_end|plan|next_step|prev_step|clear|switch_floor|reply|sos|none",
+  "target_room_id": "房间ID，如 r1_101（仅 navigate 意图需要）",
+  "target_floor": 楼层数字（仅 switch_floor 需要）,
+  "reply": "给用户的语音回复文字，简洁友好，一句话",
+  "auto_plan": true/false（设置完起点终点后是否自动规划）
+}
+
+## 意图说明
+- navigate: 用户想导航到某处。action=set_start(设起点) / set_end(设终点)
+- control: 导航控制。action=plan(开始规划) / next_step / prev_step / clear(清除路线)
+- switch_floor: 切换楼层。action=switch_floor
+- help: 用户遇到困难或求助（"我迷路了""看不清""帮帮我"），给予安抚和指引
+- sos: 用户请求紧急求助（"紧急呼叫""紧急求助""救命""报警"），action=sos，立即触发紧急求助弹窗
+- chat: 闲聊或询问（"几点了""谢谢"），简短回应
+- none: 无法理解，让用户重新说
+
+## 重要规则
+1. "厕所""卫生间""洗手间""WC" 都对应卫生间，每层一个
+2. 如果用户只说了一个地点且没有明确说"从...出发"，优先设为终点
+3. 如果上下文中已有起点，新说的地点自动设为终点
+4. 回复必须简洁，因为会通过语音播报，不要太长
+5. 只返回 JSON，不要返回其他内容`;
+}
+
+// 调用 AI 获取意图（通过自建 Cloudflare Worker 代理）
+async function callAI(userText) {
+    try {
+        // 构建消息列表（系统提示 + 历史对话 + 当前输入）
+        const messages = [
+            { role: 'system', content: buildSystemPrompt() },
+        ];
+
+        // 添加历史对话（最近6轮）
+        for (const msg of conversationHistory) {
+            messages.push(msg);
+        }
+
+        // 当前用户输入
+        messages.push({ role: 'user', content: userText });
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT);
+
+        const response = await fetch(AI_PROXY_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                messages,
+                temperature: 0.3,
+                max_tokens: 300,
+            }),
+            signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const errText = await response.text().catch(() => '');
+            throw new Error(`HTTP ${response.status}: ${errText.substring(0, 200)}`);
+        }
+
+        const data = await response.json();
+
+        if (!data.success || !data.reply) {
+            throw new Error(data.error || 'AI 返回数据异常');
+        }
+
+        // 记录到对话历史
+        conversationHistory.push({ role: 'user', content: userText });
+        conversationHistory.push({ role: 'assistant', content: data.reply });
+
+        // 限制历史长度
+        while (conversationHistory.length > MAX_HISTORY_ROUNDS * 2) {
+            conversationHistory.shift();
+            conversationHistory.shift();
+        }
+
+        return data.reply;
+
+    } catch (err) {
+        console.log('[AI] 调用失败:', err.message);
+        return null; // 返回 null，降级到关键词匹配
+    }
+}
+
+// 解析 AI 返回的 JSON
+function parseAIResponse(replyText) {
+    try {
+        // 提取 JSON（可能被包裹在 markdown 代码块中）
+        let jsonStr = replyText.trim();
+        const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (codeBlockMatch) {
+            jsonStr = codeBlockMatch[1].trim();
+        }
+        // 找到第一个 { 和最后一个 }
+        const firstBrace = jsonStr.indexOf('{');
+        const lastBrace = jsonStr.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+            jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
+        }
+
+        const result = JSON.parse(jsonStr);
+        return {
+            intent: result.intent || 'none',
+            action: result.action || 'none',
+            targetRoomId: result.target_room_id || null,
+            targetFloor: result.target_floor || null,
+            reply: result.reply || '',
+            autoPlan: result.auto_plan === true,
+        };
+    } catch (e) {
+        console.log('[AI] JSON 解析失败:', e.message, '原文:', replyText);
+        return null;
+    }
+}
+
+// 根据 AI 解析结果执行操作
+function executeAIIntent(parsed) {
+    if (!parsed) return false;
+
+    switch (parsed.action) {
+        case 'set_start':
+        case 'set_end': {
+            if (!parsed.targetRoomId) return false;
+            const room = ALL_ROOMS.find(r => r.id === parsed.targetRoomId);
+            if (!room) return false;
+
+            const selectId = parsed.action === 'set_start' ? 'startSelect' : 'endSelect';
+            const select = document.getElementById(selectId);
+            if (select) select.value = room.id;
+
+            const label = parsed.action === 'set_start' ? '起点' : '终点';
+            showResult(`已设置${label}：${room.name}`, 'success');
+            playSuccessSound();
+            hapticFeedback('success');
+
+            // 自动规划
+            if (parsed.autoPlan) {
+                const startSel = document.getElementById('startSelect');
+                const endSel = document.getElementById('endSelect');
+                if (startSel?.value && endSel?.value) {
+                    setTimeout(() => {
+                        const planBtn = document.getElementById('planBtn');
+                        if (planBtn) planBtn.click();
+                    }, 1500);
+                }
+            }
+            return true;
+        }
+        case 'plan': {
+            const planBtn = document.getElementById('planBtn');
+            if (planBtn) planBtn.click();
+            return true;
+        }
+        case 'next_step': {
+            const nextBtn = document.getElementById('nextStep');
+            if (nextBtn && !nextBtn.disabled) nextBtn.click();
+            return true;
+        }
+        case 'prev_step': {
+            const prevBtn = document.getElementById('prevStep');
+            if (prevBtn && !prevBtn.disabled) prevBtn.click();
+            return true;
+        }
+        case 'clear': {
+            const clearBtn = document.getElementById('clearBtn');
+            if (clearBtn) {
+                clearBtn.click();
+                speak('已清除路线');
+            }
+            return true;
+        }
+        case 'switch_floor': {
+            if (parsed.targetFloor && parsed.targetFloor >= 1 && parsed.targetFloor <= 3) {
+                switchToFloor(parsed.targetFloor);
+            }
+            return true;
+        }
+        case 'sos': {
+            triggerSOS();
+            speak('紧急求助已发起');
+            return true;
+        }
+        case 'reply':
+            return true; // 纯语音回复，不需要执行操作
+        default:
+            return false;
+    }
+}
+
+// ============================================
+// 模糊匹配房间（用于 AI 不可用时的关键词降级）
+// ============================================
+function matchRoomByText(text) {
+    if (!text || typeof text !== 'string') return null;
+    const t = text.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '').toLowerCase();
+
+    // 1. 精确匹配房间 ID（r1_101 / 101）
+    for (const r of ALL_ROOMS) {
+        if (r.id.toLowerCase() === t) return r;
+        // r1_101 → 匹配 "101"
+        const num = r.id.match(/\d+/)?.[0];
+        if (num && t.includes(num)) return r;
+    }
+
+    // 2. 名称关键词匹配（去掉 emoji）
+    const synonyms = {
+        '卫生间': ['厕所', '洗手间', 'wc', '马桶间'],
+        '办公室': ['教务', '系所', '导师'],
+        '教室': ['教室', '课堂', '课室'],
+        '实验室': ['实验室', '理化'],
+        '计算机室': ['计算机', '电脑室', '机房'],
+    };
+
+    let best = null, bestScore = 0;
+    for (const r of ALL_ROOMS) {
+        const name = r.name.replace(/[\u{1F000}-\u{1FFFF}]/gu, '').replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '');
+        let score = 0;
+
+        // 直接包含名称关键词
+        if (t.includes(name.toLowerCase()) || name.toLowerCase().includes(t)) score = 3;
+
+        // 同义词匹配
+        for (const [canon, syns] of Object.entries(synonyms)) {
+            if (name.includes(canon) && syns.some(s => t.includes(s))) { score = Math.max(score, 2); }
+        }
+
+        // 楼层 + 类型匹配（如"一楼教室"）
+        if (t.includes(`${r.floor}`) && name.length > 0) score = Math.max(score, 1);
+
+        if (score > bestScore) { bestScore = score; best = r; }
+    }
+
+    return bestScore > 0 ? best : null;
+}
+
+// ── 解析语音指令并执行（AI 优先 + 关键词降级） ──
+async function processVoiceCommand(text) {
+    console.log('[语音指令] 原始文本:', text);
+
+    // 显示识别结果到语音面板
+    const resultEl = document.querySelector('#voicePanel .voice-text');
+    if (resultEl) {
+        resultEl.textContent = '识别到：' + (text || '（无内容）');
+    }
+    // 播报识别内容，让用户确认
+    if (text) speak('识别到：' + text);
+
+    // ===== 第一优先：AI 智能理解 =====
+    updateVoiceStatus('thinking');
+    const aiReply = await callAI(text);
+    updateVoiceStatus('processing');
+
+    if (aiReply) {
+        console.log('[AI] 回复:', aiReply);
+        const parsed = parseAIResponse(aiReply);
+
+        if (parsed && parsed.action && parsed.action !== 'none') {
+            // 执行 AI 意图（set_end / set_start / plan / clear 等）
+            executeAIIntent(parsed);
+            // plan 动作：路线摘要已由 planRoute 里的代码 speak() 生成，不要被 AI 瞎编的 reply 覆盖
+            // 其他动作：如果 AI 有回复文本，播报它
+            if (parsed.action !== 'plan' && parsed.reply) speak(parsed.reply);
+            return; // ✅ AI 成功处理后直接返回，不再走关键词降级
+        }
+    }
+
+    // ===== 第二优先：关键词匹配降级 =====
+    console.log('[语音指令] AI 不可用，降级到关键词匹配');
+    const startKeywords = ['从', '起点', '出发', '从这里'];
+    const endKeywords = ['去', '到', '导航', '终点', '前往', '目标'];
+    const controlKeywords = ['开始', '规划', '下一步', '上一步', '清除', '重新', '看', '切', '切换'];
+
+    const hasStart = startKeywords.some(k => text.includes(k));
+    const hasEnd = endKeywords.some(k => text.includes(k));
+    const hasControl = controlKeywords.some(k => text.includes(k));
+
+    // 控制指令检测
+    // 紧急求助（优先检测）
+    const sosKeywords = ['紧急', '求助', '救命', '帮忙', 'SOS', '报警'];
+    if (sosKeywords.some(k => text.toLowerCase().includes(k))) {
+        triggerSOS();
+        speak('紧急求助已发起');
+        return;
+    }
+    if (text.includes('开始') || text.includes('规划')) {
+        const planBtn = document.getElementById('planBtn');
+        if (planBtn) {
+            planBtn.click();
+            return;
+        }
+    }
+    if (text.includes('下一步')) {
+        const nextBtn = document.getElementById('nextStep');
+        if (nextBtn && !nextBtn.disabled) {
+            nextBtn.click();
+            return;
+        }
+    }
+    if (text.includes('上一步')) {
+        const prevBtn = document.getElementById('prevStep');
+        if (prevBtn && !prevBtn.disabled) {
+            prevBtn.click();
+            return;
+        }
+    }
+    if (text.includes('清除') || text.includes('重新')) {
+        const clearBtn = document.getElementById('clearBtn');
+        if (clearBtn) {
+            clearBtn.click();
+            speak('已清除路线');
+            return;
+        }
+    }
+    // 楼层切换
+    const floorMatch = text.match(/([一二三123])\s*楼/);
+    if (floorMatch) {
+        const floorWords = { '一': 1, '二': 2, '三': 3, '1': 1, '2': 2, '3': 3 };
+        const floor = floorWords[floorMatch[1]];
+        if (floor) {
+            switchToFloor(floor);
+            speak('已切换到' + floor + '楼');
+            return;
+        }
+    }
+
+    // 位置匹配（原有的 matchRoomByText 逻辑）
+    if (typeof matchRoomByText === 'function') {
+        const matchedRoom = matchRoomByText(text);
+        if (matchedRoom) {
+            let selectId;
+            if (hasStart) {
+                selectId = 'startSelect';
+            } else if (hasEnd) {
+                selectId = 'endSelect';
+            } else {
+                const startSelect = document.getElementById('startSelect');
+                const endSelect = document.getElementById('endSelect');
+                const startSet = startSelect && startSelect.value;
+                const endSet = endSelect && endSelect.value;
+                if (!startSet) {
+                    selectId = 'startSelect';
+                } else if (!endSet) {
+                    selectId = 'endSelect';
+                } else {
+                    selectId = 'endSelect';
+                }
+            }
+
+            const select = document.getElementById(selectId);
+            if (select) select.value = matchedRoom.id;
+
+            const label = selectId === 'startSelect' ? '起点' : '终点';
+            showResult(`已设置${label}：${matchedRoom.name}`, 'success');
+            speak(`已设置${label}：${matchedRoom.name}`);
+            playSuccessSound();
+            hapticFeedback('success');
+
+            const startSel = document.getElementById('startSelect');
+            const endSel = document.getElementById('endSelect');
+            if (startSel?.value && endSel?.value) {
+                setTimeout(() => {
+                    const planBtn = document.getElementById('planBtn');
+                    if (planBtn) planBtn.click();
+                }, 1500);
+            }
+            return;
+        }
+    }
+
+    // 都没匹配到
+    speak('抱歉，我没有听懂，请再说一次');
+}
+
+// 调用百度短语音识别 API（含重试）
+async function recognizeWithBaidu(audioBlob, mimeType, retry = 0) {
+    // 百度 API 要求的音频格式：pcm（不带头）或 wav（带标准头）
+    const pcmData = await audioBlobToPCM(audioBlob);
+    console.log('[语音识别] PCM 数据大小:', pcmData.byteLength, '字节', retry ? '[重试#' + retry + ']' : '');
+
+    if (pcmData.byteLength < 100) {
+        throw new Error('音频数据过短，请录制更长时间');
+    }
+
+    // 转为 base64
+    const base64Audio = arrayBufferToBase64(pcmData);
+
+    // 通过 Worker 代理调用百度 ASR（绕过 CORS）
+    const WORKER_URL = 'https://fragrant-salad-45ab.t0lloyd0t.workers.dev/baidu-asr';
+
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 8000);  // 8秒超时，正常网络下足够
+
+    let data;
+    try {
+        const response = await fetch(WORKER_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                speech: base64Audio,
+                len: pcmData.byteLength,
+            }),
+            signal: ctrl.signal,
+        });
+        clearTimeout(tid);
+
+        // 如果 Worker 返回错误，重试一次
+        if (!response.ok && retry < 1) {
+            console.log('[语音识别] Worker 返回异常，重试...', response.status);
+            await new Promise(r => setTimeout(r, 1000));
+            return recognizeWithBaidu(audioBlob, mimeType, retry + 1);
+        }
+
+        data = await response.json();
+    } catch (e) {
+        clearTimeout(tid);
+        if (e.name === 'AbortError') {
+            if (retry < 1) {
+                console.log('[语音识别] 超时，重试一次...');
+                await new Promise(r => setTimeout(r, 1000));
+                return recognizeWithBaidu(audioBlob, mimeType, retry + 1);
+            }
+            throw new Error('识别超时，请重试');
+        }
+        throw e;
+    }
+
+    console.log('[语音识别] API 响应:', data);
+
+    if (data.err_no === 0 && data.result && data.result.length > 0) {
+        return data.result[0];
+    } else {
+        const errMsg = {
+            3301: '音频质量差',
+            3302: '鉴权失败',
+            3303: '语音识别服务忙',
+            3304: '用户配额已用完',
+            3305: '音频时长过长',
+            3307: '语音数据为空',
+            3308: '音频过大',
+            3309: '音频格式不支持',
+            3310: '采样率不正确',
+        };
+        const msg = errMsg[data.err_no] || `错误码 ${data.err_no}`;
+        throw new Error(msg);
+    }
+}
+
+// 将录音 Blob 转换为 16kHz 16bit 单声道 PCM 数据
+async function audioBlobToPCM(blob) {
+    // 使用 Web Audio API 解码音频
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = initAudio();
+    if (!audioCtx) throw new Error('无法创建音频上下文');
+
+    let audioBuffer;
+    try {
+        audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    } catch (e) {
+        console.log('[语音识别] decodeAudioData 失败，尝试使用原始数据:', e.message);
+        // Edge/微信 WebView 解码 webm 失败时，直接返回原始 ArrayBuffer
+        // 百度 ASR 可能仍能识别（取决于浏览器是否发送了可识别的格式）
+        const rawData = new Uint8Array(arrayBuffer);
+        if (rawData.length < 1000) {
+            throw new Error('音频数据过短');
+        }
+        // 将原始数据按采样率截断（假设原始采样率>=16kHz）
+        const bytesPerSample = 2; // 假设 16bit
+        const targetBytes = Math.round(rawData.length * (BAIDU_ASR_SAMPLE_RATE / 16000));
+        const truncated = rawData.slice(0, Math.min(targetBytes, rawData.length));
+        return truncated.buffer;
+    }
+
+    // 重采样到 16kHz 单声道
+    const targetSampleRate = BAIDU_ASR_SAMPLE_RATE;
+    const numChannels = 1;
+    const length = Math.round(audioBuffer.duration * targetSampleRate);
+    const offCtx = new OfflineAudioContext(numChannels, length, targetSampleRate);
+
+    const source = offCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offCtx.destination);
+    source.start(0);
+
+    const renderedBuffer = await offCtx.startRendering();
+
+    // 提取 PCM 数据（16bit signed integer）
+    const channelData = renderedBuffer.getChannelData(0);
+    const pcmData = new Int16Array(channelData.length);
+    for (let i = 0; i < channelData.length; i++) {
+        const s = Math.max(-1, Math.min(1, channelData[i]));
+        pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+
+    return pcmData.buffer;
+}
+
+// ArrayBuffer 转 Base64
+function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+        binary += String.fromCharCode.apply(null, chunk);
+    }
+    return btoa(binary);
+}
+
+// 停止语音监听（页面卸载时调用）
+function stopVoiceListener() {
+    voiceListening = false;
+    stopRecording();
+    if (monitorStream) {
+        monitorStream.getTracks().forEach(track => track.stop());
+        monitorStream = null;
+    }
+    monitorAnalyser = null;
+    voiceInitialized = false;
+}
+
+// 绑定语音事件（持续监听模式，首次交互时初始化）
+function bindVoiceEvents() {
+    // 持续监听模式不需要按钮
+    // initVoiceListener() 在 init() 里的 initAudioOnInteraction 中调用
+
+    // 页面切回前台时恢复监听
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && voiceListening && !voiceRecording) {
+            monitorAudioLevel();
+        }
+    });
+}
+
+// 百度语音合成配置
+const BAIDU_TTS_CONFIG = {
+    appId: '7664376',
+    apiKey: 'jZie8aJhPhjd4elJIpWrh41J',
+    secretKey: 'TYSz5twRYNbKWF5DLYDZucdF9VlL1gyS'
+};
+
+// 存储 access token
+let baiduAccessToken = '24.88341b6b0af1b86b69142fb92b927417.2592000.1779791566.282335-123010579';
+let tokenExpireTime = Date.now() + (25 * 24 * 60 * 60 * 1000); // token 获取时间: 2026-04-26, 有效期30天, 设25天过期
+
+// 获取百度 access token（优先走 Worker 刷新，兜底硬编码）
+async function getBaiduAccessToken() {
+    // 硬编码 token 有效期内直接返回
+    if (baiduAccessToken && Date.now() < tokenExpireTime) {
+        return baiduAccessToken;
+    }
+
+    // 优先：走 Worker /baidu-token 刷新（最稳定）
+    try {
+        const workerUrl = 'https://fragrant-salad-45ab.t0lloyd0t.workers.dev/baidu-token';
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 6000);
+        const res = await fetch(workerUrl, { signal: ctrl.signal });
+        clearTimeout(tid);
+        if (res.ok) {
+            const json = await res.json();
+            if (json.token) {
+                baiduAccessToken = json.token;
+                tokenExpireTime = json.expireAt || (Date.now() + 25 * 24 * 60 * 60 * 1000);
+                console.log('[Token] Worker 刷新成功');
+                return baiduAccessToken;
+            }
+        }
+    } catch (e) {
+        console.log('[Token] Worker 刷新失败:', e.message);
+    }
+
+    // 降级：CORS 代理刷新
+    console.log('[Token] 尝试 CORS 代理刷新...');
+    const tokenUrl = 'https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id='
+        + BAIDU_TTS_CONFIG.apiKey + '&client_secret=' + BAIDU_TTS_CONFIG.secretKey;
+
+    const proxyUrls = [
+        'https://corsproxy.io/?',
+        'https://api.allorigins.win/raw?url=',
+    ];
+
+    for (const proxy of proxyUrls) {
+        try {
+            const response = await fetch(proxy + encodeURIComponent(tokenUrl));
+            const data = await response.json();
+            if (data.access_token) {
+                baiduAccessToken = data.access_token;
+                tokenExpireTime = Date.now() + (29 * 24 * 60 * 60 * 1000);
+                console.log('[Token] CORS 代理刷新成功');
+                return baiduAccessToken;
+            }
+        } catch (e) {
+            console.log('[Token] 代理', proxy, '失败');
+        }
+    }
+
+    // 最后兜底：返回硬编码 token（可能已过期但试试看）
+    console.log('[Token] 所有刷新方案失败，返回硬编码 token');
+    return baiduAccessToken;
+}
+
+// CORS 代理列表（用于手机浏览器中转百度TTS请求）
+const CORS_PROXIES = [
+    'https://corsproxy.io/?',
+    'https://api.allorigins.win/raw?url=',
+];
+
+// 使用百度语音合成播报
+async function speakWithBaidu(text) {
+    const token = await getBaiduAccessToken();
+    if (!token) {
+        console.log('[TTS] 无法获取百度 token');
+        return false;
+    }
+
+    // 构建语音合成 URL
+    const params = new URLSearchParams({
+        tex: encodeURIComponent(text),
+        tok: token,
+        cuid: BAIDU_TTS_CONFIG.appId,
+        ctp: '1',
+        lan: 'zh',
+        spd: '5',
+        pit: '5',
+        vol: '15',
+        per: '0',
+        aue: '3'
+    });
+
+    const ttsUrl = `https://tsn.baidu.com/text2audio?${params.toString()}`;
+
+    // 确保音频上下文已恢复（移动端需要）
+    const ctx = initAudio();
+    if (ctx && ctx.state === 'suspended') {
+        await ctx.resume();
+    }
+
+    // 策略1：直接请求（电脑端 Chrome/Edge 通常可以）
+    console.log('[TTS] 策略1：直连百度TTS');
+    let success = await tryWebAudio(ttsUrl);
+    if (success) return true;
+
+    // 策略2：通过 CORS 代理 + Web Audio API
+    for (let i = 0; i < CORS_PROXIES.length; i++) {
+        console.log('[TTS] 策略2.' + (i+1) + '：CORS代理 + WebAudio');
+        success = await tryWebAudio(CORS_PROXIES[i] + encodeURIComponent(ttsUrl));
+        if (success) return true;
+    }
+
+    // 策略3：通过 CORS 代理 + <audio> 元素
+    for (let i = 0; i < CORS_PROXIES.length; i++) {
+        console.log('[TTS] 策略3.' + (i+1) + '：CORS代理 + audio元素');
+        success = await playWithAudioElement(CORS_PROXIES[i] + encodeURIComponent(ttsUrl));
+        if (success) return true;
+    }
+
+    // 策略4：直接用 <audio> 元素（兜底）
+    console.log('[TTS] 策略4：直连 + audio元素');
+    success = await playWithAudioElement(ttsUrl);
+    if (success) return true;
+
+    console.log('[TTS] 所有策略均失败');
+    return false;
+}
+
+// 用 XHR + Web Audio API 播放
+async function tryWebAudio(url) {
+    try {
+        const arrayBuffer = await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            xhr.responseType = 'arraybuffer';
+            xhr.timeout = 6000;
+            xhr.onload = function() {
+                if (xhr.status === 200 && xhr.response && xhr.response.byteLength > 0) {
+                    resolve(xhr.response);
+                } else {
+                    reject(new Error('XHR status: ' + xhr.status + ', size: ' + (xhr.response ? xhr.response.byteLength : 0)));
+                }
+            };
+            xhr.onerror = function() { reject(new Error('XHR network error')); };
+            xhr.ontimeout = function() { reject(new Error('XHR timeout')); };
+            xhr.send();
+        });
+
+        console.log('[TTS] 音频数据下载成功，大小:', arrayBuffer.byteLength);
+
+        const audioCtx = initAudio();
+        if (!audioCtx) return false;
+
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        console.log('[TTS] 解码成功，时长:', audioBuffer.duration.toFixed(2), '秒');
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = 1.0;
+        source.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        source.start(0);
+
+        await new Promise(resolve => {
+            source.onended = resolve;
+        });
+
+        return true;
+    } catch (e) {
+        console.log('[TTS] Web Audio 方式失败:', e.message);
+        return false;
+    }
+}
+
+// 用 <audio> 元素播放 TTS 音频（兼容性最佳，手机浏览器可靠）
+function playWithAudioElement(url) {
+    return new Promise((resolve) => {
+        try {
+            const audio = new Audio();
+            audio.preload = 'auto';
+
+            const timeoutId = setTimeout(() => {
+                console.log('[TTS] audio 元素超时');
+                audio.pause();
+                audio.src = '';
+                resolve(false);
+            }, 10000);
+
+            audio.oncanplaythrough = () => {
+                console.log('[TTS] audio 元素可以播放');
+                audio.play().then(() => {
+                    console.log('[TTS] audio 元素播放成功');
+                }).catch(err => {
+                    console.log('[TTS] audio.play() 失败:', err.message);
+                    resolve(false);
+                });
+            };
+
+            audio.onended = () => {
+                clearTimeout(timeoutId);
+                console.log('[TTS] audio 元素播放完毕');
+                resolve(true);
+            };
+
+            audio.onerror = (e) => {
+                clearTimeout(timeoutId);
+                console.log('[TTS] audio 元素加载失败');
+                resolve(false);
+            };
+
+            audio.src = url;
+        } catch (e) {
+            console.log('[TTS] audio 元素创建失败:', e.message);
+            resolve(false);
+        }
+    });
+}
+
+// 判断是否为移动端
+function isMobile() {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
+        || (navigator.maxTouchPoints > 1);
+}
+
+// 用浏览器自带 speechSynthesis 播报（无需网络，兼容性好）
+function speakWithBrowser(text) {
+    return new Promise((resolve) => {
+        if (!window.speechSynthesis || typeof window.speechSynthesis.speak !== 'function') {
+            console.log('[TTS] speechSynthesis 不可用');
+            resolve(false);
+            return;
+        }
+        try {
+            window.speechSynthesis.cancel();
+            const utt = new SpeechSynthesisUtterance(text);
+            utt.lang = "zh-CN";
+            utt.rate = 1.1;
+            utt.pitch = 1;
+            utt.volume = 1;
+
+            utt.onend = () => { resolve(true); };
+            utt.onerror = (e) => {
+                // error="interrupted" 是 cancel 导致的，不算真正失败
+                if (e.error === 'interrupted' || e.error === 'canceled') {
+                    resolve(true);
+                } else {
+                    console.log('[TTS] speechSynthesis 错误:', e.error);
+                    resolve(false);
+                }
+            };
+
+            // Chrome 长时间不用的 bug：需要 cancel 后立即 speak
+            window.speechSynthesis.speak(utt);
+
+            // 安全超时（防止 onend 不触发）
+            setTimeout(() => resolve(true), 15000);
+        } catch (e) {
+            console.log('[TTS] speechSynthesis 异常:', e);
+            resolve(false);
+        }
+    });
+}
+
+// 语音播报队列（防止重叠打断）
+let speechQueue = [];
+let isSpeaking = false;
+
+async function _doSpeak(text) {
+    // 始终更新界面文字
+    const el = document.querySelector(".voice-text");
+    if (el) el.textContent = text;
+    
+    if (!state.voiceEnabled) return;
+
+    // 移动端优先用系统语音合成
+    if (isMobile()) {
+        const browserSuccess = await speakWithBrowser(text);
+        if (browserSuccess) return;
+    }
+    
+    // 电脑端：百度语音合成
+    const baiduSuccess = await speakWithBaidu(text);
+    if (baiduSuccess) return;
+    
+    // 兜底：系统语音
+    await speakWithBrowser(text);
+}
+
+async function speak(text) {
+    // 加入队列，等待前面的说完再播
+    speechQueue.push(text);
+    if (isSpeaking) return;
+
+    // 如果正在录音，先停掉（避免把刚播报的声音录进去）
+    if (voiceRecording) {
+        console.log('[TTS] 播报前停止正在进行的录音');
+        stopRecording();
+    }
+    
+    isSpeaking = true;
+    while (speechQueue.length > 0) {
+        const next = speechQueue.shift();
+        await _doSpeak(next);
+    }
+    isSpeaking = false;
+}
+
+function speakCurrentStep() {
+    const step = state.pathSteps[state.currentStep];
+    if (!step) return;
+
+    // 根据步骤类型强化语音提示
+    let text;
+
+    if (step.isArrival) {
+        // 到达目的地：强提示
+        text = `🎉 已到达目的地：${step.instruction.replace('到达 ', '')}！${step.hint}`;
+        playSuccessSound();
+        hapticFeedback("success");
+    } else if (step.isFloorChange) {
+        // 换层：强调楼层
+        const floorWord = step.toFloor > step.fromFloor ? "上楼" : "下楼";
+        text = `⚠️ ${floorWord}！请注意安全！到达第 ${step.toFloor} 层后，继续沿走廊前行。`;
+        playStepSound();
+        hapticFeedback("medium");
+    } else if (step.isTurn) {
+        // 转向：强调方向
+        const turnText = step.instruction;
+        const turnEmphasis = turnText.includes("左转") ? "请沿走廊左侧通行。" :
+                            turnText.includes("右转") ? "请沿走廊右侧通行。" : "请注意转角处。";
+        text = `${turnText}。${turnEmphasis}`;
+        playStepSound();
+        hapticFeedback("light");
+    } else {
+        // 普通步骤
+        text = `第 ${state.currentStep+1} 步：${step.instruction}。${step.hint}`;
+        playStepSound();
+    }
+
+    speak(text);
+}
+
+function hapticFeedback(type = "light") {
+    if (!navigator.vibrate) return;
+    const p = { light:[10], medium:[20], heavy:[30,50,30], success:[10,50,10], error:[50,100,50] };
+    navigator.vibrate(p[type] || p.light);
+}
+
+// ============================================
+// 地图控制
+// ============================================
+function zoomIn()  { state.scale = Math.min(5, state.scale * 1.2); }
+function zoomOut() { state.scale = Math.max(0.4, state.scale / 1.2); }
+function resetView() { fitView(); }
+
+// ============================================
+// 紧急求助
+// ============================================
+function triggerSOS() {
+    const modal = document.getElementById('sosModal');
+    if (!modal) return;
+
+    // 获取当前位置
+    const startSel = document.getElementById('startSelect');
+    const currentFloor = state.viewFloor;
+    let locationText = `第 ${currentFloor} 层`;
+
+    if (startSel?.value) {
+        const room = ALL_ROOMS.find(r => r.id === startSel.value);
+        if (room) {
+            const shortName = room.name.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '').trim();
+            locationText = `第 ${room.floor} 层 · ${shortName}`;
+        }
+    }
+
+    // 更新时间戳
+    const now = new Date();
+    const timeStr = now.toTimeString().slice(0, 8);
+    const locEl = document.getElementById('sosLocation');
+    const timeEl = document.getElementById('sosTime');
+    if (locEl) locEl.textContent = locationText;
+    if (timeEl) timeEl.textContent = timeStr;
+
+    // 显示弹窗
+    modal.classList.remove('is-hidden');
+
+    // 震动反馈
+    if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 100]);
+
+    console.log('[SOS] 紧急求助已触发，当前位置：' + locationText);
+}
+
+function closeSOS() {
+    const modal = document.getElementById('sosModal');
+    if (modal) modal.classList.add('is-hidden');
+}
+
+// ============================================
+// 事件绑定
+// ============================================
+function bindEvents() {
+    document.getElementById("planBtn")?.addEventListener("click", planRoute);
+    document.getElementById("clearBtn")?.addEventListener("click", clearRoute);
+    document.getElementById("quickSwap")?.addEventListener("click", swapLocations);
+    document.getElementById("voiceToggle")?.addEventListener("click", toggleVoice);
+    document.getElementById("zoomIn")?.addEventListener("click", zoomIn);
+    document.getElementById("zoomOut")?.addEventListener("click", zoomOut);
+    document.getElementById("resetView")?.addEventListener("click", resetView);
+    document.getElementById("closeStep")?.addEventListener("click", hideStepPanel);
+    document.getElementById("nextStep")?.addEventListener("click", nextStep);
+    document.getElementById("prevStep")?.addEventListener("click", prevStep);
+    document.getElementById("sosBtn")?.addEventListener("click", triggerSOS);
+    document.getElementById("sosCloseBtn")?.addEventListener("click", closeSOS);
+    document.querySelector(".sos-backdrop")?.addEventListener("click", closeSOS);
+
+    document.addEventListener("keydown", e => {
+        if (e.key === "Escape")                             { hideStepPanel(); closeSOS(); }
+        if (e.key === "ArrowRight" || e.key === " ")        { e.preventDefault(); nextStep(); }
+        if (e.key === "ArrowLeft")                          { e.preventDefault(); prevStep(); }
+        if (e.key === "v" && (e.ctrlKey||e.metaKey))        { e.preventDefault(); toggleVoice(); }
+        if (e.key === "1") switchToFloor(1);
+        if (e.key === "2") switchToFloor(2);
+        if (e.key === "3") switchToFloor(3);
+    });
+}
+
+// ============================================
+// 语音按钮状态同步
+// ============================================
+function updateVoiceButton() {
+    const btn = document.getElementById("voiceToggle");
+    const icon = btn?.querySelector(".voice-icon");
+    const voiceText = document.querySelector(".voice-text");
+    
+    if (!btn || !icon) return;
+    
+    if (state.voiceEnabled) {
+        btn.classList.add("active");
+        btn.setAttribute("aria-pressed", "true");
+        btn.setAttribute("aria-label", "语音导航已开启");
+        icon.textContent = "🔊";
+        if (voiceText) {
+            voiceText.textContent = "语音已开启，点击页面任意位置激活语音功能";
+        }
+    } else {
+        btn.classList.remove("active");
+        btn.setAttribute("aria-pressed", "false");
+        btn.setAttribute("aria-label", "语音导航已关闭");
+        icon.textContent = "🔇";
+        if (voiceText) {
+            voiceText.textContent = "语音导航已关闭";
+        }
+    }
+}
+
+// ============================================
+// 初始化
+// ============================================
+function init() {
+    initCanvas();
+    initSelectors();
+    initFloorButtons();
+    bindEvents();
+    bindVoiceEvents();
+    updateFloorBadge(state.viewFloor);
+
+    // 同步语音按钮初始状态
+    updateVoiceButton();
+    
+    // 首次用户交互时：初始化音频上下文 + 启动语音持续监听
+    if (state.voiceEnabled) {
+        let hasInitialized = false;
+        const onFirstInteraction = async () => {
+            if (hasInitialized) return;
+            hasInitialized = true;
+            
+            // 必须在用户手势的同步调用栈里立即初始化音频上下文
+            const ctx = initAudio();
+            if (ctx && ctx.state === 'suspended') {
+                ctx.resume();
+            }
+            
+            document.removeEventListener("click", onFirstInteraction);
+            document.removeEventListener("touchstart", onFirstInteraction);
+            
+            // 预获取百度 token
+            await getBaiduAccessToken();
+            speak("语音导航已开启，直接说话即可控制");
+            
+            // 启动持续语音监听
+            await initVoiceListener();
+        };
+        document.addEventListener("click", onFirstInteraction);
+        document.addEventListener("touchstart", onFirstInteraction);
+    }
+    
+    // 页面卸载时清理资源
+    window.addEventListener('beforeunload', stopVoiceListener);
+    
+    console.log("室内导航系统 v3.0（多楼层）已启动");
+    console.log(`楼层数：3，每层地图：${ROWS}x${COLS}，楼梯节点：${Object.keys(STAIR_NODES).length}处`);
+}
+
+document.readyState === "loading"
+    ? document.addEventListener("DOMContentLoaded", init)
+    : init();
